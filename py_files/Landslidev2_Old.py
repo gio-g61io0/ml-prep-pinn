@@ -1,3 +1,4 @@
+from logging import critical
 from py_files import metrics
 import importlib
 import os
@@ -29,7 +30,7 @@ from .GallenModel_v1 import (
     DisplacementLayerFOSMakilala,
     ProportionSlabThicknessLayer
 )
-from .GallenModel import FosLayer
+from .GallenModel import CriticalAcceleration, DisplacementIntermediate, FosLayer
 from .metrics import OrdinalAccuracy
 
 
@@ -175,9 +176,12 @@ class LandslideV4:
         ifi = ClipLayer(0.15, 0.75, name="ifi_clip")(ifi) # Clip values between 0.15 - 0.75 radians
         m = ClipLayer(0, 1, name="m_clip")(m)
 
-        ds, critical_acceleration = DisplacementLayerFOSMakilala()([coh, ifi, slope, pga_input, bulk_density, m])
-        critical_acceleration = FosLayer()(critical_acceleration)
+        ds, fos, critical_acceleration = DisplacementLayerFOSMakilala()([coh, ifi, slope, pga_input, bulk_density, m])
         
+        fos = FosLayer()(fos)
+        critical_acceleration = CriticalAcceleration()(critical_acceleration)
+        ds = DisplacementIntermediate()(ds)
+
         if self.activation == "prelu":
             ds = layers.PReLU()(ds)
         elif self.activation == "relu":
@@ -190,7 +194,7 @@ class LandslideV4:
             print("default")
             ds = layers.ReLU()(ds)  # defaults to ReLU activation if none of the above
 
-        sus = NewmarkActivation(threshold=5.0)(ds, critical_acceleration)
+        sus = NewmarkActivation(threshold=5.0)(ds, fos, critical_acceleration)
         self.model = Model(inputs= all_inputs + [pga_input], outputs=sus)
 
 

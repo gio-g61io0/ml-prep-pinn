@@ -317,7 +317,7 @@ class DisplacementLayerFOSMakilala(tf.keras.layers.Layer):
         powcomp = tf.math.pow((1 - acpg), 2.341) * tf.math.pow(acpg, -1.438)
         logds = 0.215 + tf.math.log(powcomp) + 0.51  # NOTE:: Newmark Displacement
 
-        return tf.math.exp(logds), safety_factor
+        return tf.math.exp(logds), safety_factor, ac
     
 @tf.keras.utils.register_keras_serializable()
 class DisplacementLayer(tf.keras.layers.Layer):
@@ -538,7 +538,7 @@ class NewmarkActivation(tf.keras.layers.Layer):
         super(NewmarkActivation, self).__init__(**kwargs)
         self.threshold = threshold
 
-    def call(self, inputs):
+    def call(self, inputs, safety_factor, ac):
         return 1.0 / (
             1.0 + tf.exp(self.threshold - inputs)
         )  # The activation function based on the paper

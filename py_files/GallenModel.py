@@ -184,8 +184,7 @@ class LoggingRandomSearch(RandomSearch):
         plt.close()
 
         return history  # return history to preserve behavior
-
-
+    
 @tf.keras.utils.register_keras_serializable()
 class FosLayer(tf.keras.layers.Layer):
     def __init__(self, **kwargs):
