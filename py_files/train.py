@@ -1,11 +1,12 @@
-import importlib, data, metrics
+from py_files import data, metrics
+import importlib
 importlib.reload(data)
 importlib.reload(metrics)
 import tensorflow as tf
-from data import dataframe_to_dataset, dataframe_to_dataset_multi, NormalizationLayer, CategoricalEncoderLayer, ensure_2d
-from metrics import roc_auc_score_multiclass
+from py_files.data import dataframe_to_dataset, dataframe_to_dataset_multi, NormalizationLayer, CategoricalEncoderLayer, ensure_2d
+from py_files.metrics import roc_auc_score_multiclass
 from sklearn.model_selection import KFold, StratifiedKFold
-from Landslidev2_Old import LandslideV2, LandslideV4
+from py_files.Landslidev2_Old import LandslideV2, LandslideV4
 import sklearn
 # from metrics import find_best_threshold
 import contextily as cx

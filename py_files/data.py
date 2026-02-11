@@ -1,10 +1,9 @@
 import tensorflow as tf
 import numpy as np
 from typing import List
-from GallenModel_v1 import  NewmarkActivation, DisplacementLayer, LandslideActivationLayer, CohesionLayer, InternalFrictionLayer, ClipLayer
+from py_files.GallenModel_v1 import  NewmarkActivation, DisplacementLayer, LandslideActivationLayer, CohesionLayer, InternalFrictionLayer, ClipLayer
 # from Landslidev2_Old import LandslideV2
 from sklearn.utils import resample
-from geotech import trainmodel_geotech
 
 
 #THIS MODULE CONTAINS DATA LOADING AND PREPROCESSING FUNCTIONS
