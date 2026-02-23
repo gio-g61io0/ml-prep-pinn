@@ -174,7 +174,7 @@ class LandslideV4:
 
         coh = ClipLayer(5, 40, name="cohesion_clip")(coh)
         ifi = ClipLayer(0.15, 0.75, name="ifi_clip")(ifi) # Clip values between 0.15 - 0.75 radians
-        m = ClipLayer(0, 1, name="m_clip")(m)
+        m = ClipLayer(0, 0.5, name="m_clip")(m)
 
         ds, fos, critical_acceleration = DisplacementLayerFOSMakilala()([coh, ifi, slope, pga_input, bulk_density, m])
         
