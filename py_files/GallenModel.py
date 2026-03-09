@@ -207,8 +207,8 @@ class CriticalAcceleration(tf.keras.layers.Layer):
         )  # default name if not provided
         super(CriticalAcceleration, self).__init__(**kwargs)
 
-    def call(self, ac):
-        return ac
+    def call(self, ac, acpg):
+        return ac, acpg
 
     @classmethod
     def from_config(cls, config):  # For deserialization purpose

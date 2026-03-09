@@ -43,6 +43,50 @@ numeric_cols = [
     "Prc_std",
 ]
 
+@tf.keras.utils.register_keras_serializable()
+class DisplacementLayerRainFall(tf.keras.layers.Layer):
+    def __init__(self, **kwargs):
+        super(DisplacementLayerRainFall, self).__init__(**kwargs)
+
+
+    def call(self, inputs):
+        cohesion_t, friction_angle, slope, pga, bulk_density, m = (
+            inputs[0],
+            inputs[1],
+            inputs[2],
+            inputs[3],
+            inputs[4],
+            inputs[5],
+
+        )
+        slope *= 0.017453292519943295
+
+        pga *= 9.81
+        cohesion_t *= 1000.0 #kPa -> Pa
+        bulk_density *= 1000.0  # kN/m^3 to N/m^3
+        slope_normal_thickness = 3.33  # m
+        cohesion_t = tf.expand_dims(cohesion_t, 1)
+        friction_angle = tf.expand_dims(friction_angle, 1)
+        m = tf.reshape(m, [-1])          # flatten to (batch,) in case it arrives as (batch,1)
+        m = tf.expand_dims(m, 1)
+
+        water_unit_weight = 9.81 #This is 9.81 N/m^3
+       
+        safety_factor = (cohesion_t / ((bulk_density * slope_normal_thickness) * tf.math.sin(slope))) + (tf.math.tan(friction_angle) / tf.math.tan(slope)) - ((m * water_unit_weight * tf.math.tan(friction_angle)) / (bulk_density * tf.math.tan(slope)))
+
+        ac = (
+            (safety_factor - 1) * 9.81 * tf.math.sin(slope)
+        )  # NOTE::Critical Acceleration
+        
+        ac = layers.ReLU()(ac)
+
+        acpg = ac / pga
+        acpg = tf.clip_by_value(acpg, 0.001, 0.75)
+
+        powcomp = tf.math.pow((1 - acpg), 2.341) * tf.math.pow(acpg, -1.438)
+        logds = 0.215 + tf.math.log(powcomp) + 0.51  # NOTE:: Newmark Displacement
+
+        return tf.math.exp(logds), safety_factor, ac, acpg
 
 def build_model_pinn(train_df):
     def model_fn(hp):
@@ -175,6 +219,93 @@ class LoggingRandomSearch(RandomSearch):
         plt.close()
 
         return history  # return history to preserve behavior
+
+@tf.keras.utils.register_keras_serializable()
+class HydraulicConductivityLayer(tf.keras.layers.Layer):
+    """Learnable hydraulic conductivity (K) per soil type.
+
+    Input: soil_type_idx (int, 0-2)
+    Output: K in m/hr
+
+    Soil types: 0=Sandy Clay Loam, 1=Loam, 2=Undifferentiated
+    """
+    def __init__(self, **kwargs):
+        kwargs.setdefault("name", "hydraulic_conductivity")
+        super(HydraulicConductivityLayer, self).__init__(**kwargs)
+        # K ranges in cm/s per soil type
+        self.k_min = tf.constant([1e-5, 1e-7, 1e-7], dtype=tf.float32)
+        self.k_max = tf.constant([1e-3, 1e-5, 1e-3], dtype=tf.float32)
+
+    def build(self, input_shape):
+        self.u_k = self.add_weight(
+            name="u_k",
+            shape=(3,),
+            initializer=tf.keras.initializers.Constant(0.0),
+            trainable=True,
+        )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        # inputs: soil_type_idx (batch,1) float — flatten to (batch,) int
+        soil_idx = tf.cast(tf.reshape(inputs, [-1]), tf.int32)
+        # K in cm/s via sigmoid scaling
+        k_cms = self.k_min + (self.k_max - self.k_min) * tf.nn.sigmoid(self.u_k)
+        # Use one_hot + matmul instead of tf.gather to avoid
+        # UnsortedSegmentSum shape errors in the backward pass
+        one_hot = tf.one_hot(soil_idx, depth=3, dtype=tf.float32)
+        k_per_sample = tf.reduce_sum(one_hot * k_cms, axis=-1)
+        # Convert cm/s -> m/hr: × 0.01 × 3600 = × 36
+        k_mhr = k_per_sample * 36.0
+        return k_mhr
+
+    def get_config(self):
+        config = super().get_config()
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+
+@tf.keras.utils.register_keras_serializable()
+class WetnessLayer(tf.keras.layers.Layer):
+    """Computes empirical wetness m = (R * α) / (T * sin θ), clamped to [0, 1].
+
+    Input: [precipitation (mm/month), contributing_area (m²), soil_thickness (m), slope (deg), k (m/hr)]
+    Output: m ∈ [0, 1]
+    """
+    def __init__(self, **kwargs):
+        kwargs.setdefault("name", "wetness_layer")
+        super(WetnessLayer, self).__init__(**kwargs)
+
+    def call(self, inputs):
+        precipitation, contributing_area, soil_thickness, slope, k = (
+            inputs[0], inputs[1], inputs[2], inputs[3], inputs[4]
+        )
+        # k comes from HydraulicConductivityLayer as (batch,);
+        # expand to (batch,1) to match the other (batch,1) inputs
+        k = tf.expand_dims(k, -1)
+        # Convert precipitation mm/month -> m/hr
+        r = precipitation * (0.001 / 720.0)
+        # Convert slope degrees -> radians
+        slope_rad = slope * 0.017453292519943295
+        # Transmissivity T = K * soil_thickness (m²/hr)
+        t = k * soil_thickness
+        t = tf.maximum(t, 1e-10)
+        sin_slope = tf.maximum(tf.math.sin(slope_rad), 1e-6)
+        # Wetness ratio
+        m = (r * contributing_area) / (t * sin_slope)
+        m = tf.clip_by_value(m, 0.0, 1.0)
+        return m
+
+    def get_config(self):
+        config = super().get_config()
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
 
 @tf.keras.utils.register_keras_serializable()
 class ClipLayer(tf.keras.layers.Layer):
@@ -538,7 +669,7 @@ class NewmarkActivation(tf.keras.layers.Layer):
         super(NewmarkActivation, self).__init__(**kwargs)
         self.threshold = threshold
 
-    def call(self, inputs, safety_factor, ac):
+    def call(self, inputs, safety_factor, ac, acpg):
         return 1.0 / (
             1.0 + tf.exp(self.threshold - inputs)
         )  # The activation function based on the paper

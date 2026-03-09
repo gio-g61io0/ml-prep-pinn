@@ -3,7 +3,6 @@ import numpy as np
 from typing import List
 from py_files.GallenModel_v1 import  NewmarkActivation, DisplacementLayer, LandslideActivationLayer, CohesionLayer, InternalFrictionLayer, ClipLayer
 # from Landslidev2_Old import LandslideV2
-from sklearn.utils import resample
 
 
 #THIS MODULE CONTAINS DATA LOADING AND PREPROCESSING FUNCTIONS
@@ -17,8 +16,8 @@ def preprocessing(df, columns_drop):
     columns = list(df.columns)
     df.dropna(subset=list(columns), inplace=True) #cleans the dataframe by removing null rows for all columns
     
-    columns = manipulate_cols(columns, ['DN', 'BD_mean', 'geometry', 'PGA2_max', 'Soil Type', 'description', 'descriptio'])
-    numeric_cols = [col for col in columns if col not in ['landslide', 'type', 'Landslide1', 'LITHO', 'Lithology', 'Geomorphology']]
+    columns = manipulate_cols(columns, remove_cols=['DN', 'BD_mean', 'geometry', 'PGA2_max', 'Soil Type', 'description', 'descriptio'])
+    numeric_cols = [col for col in columns if col not in ['landslide', 'type', 'Landslide1', 'LITHODESC']]
     
     return df, columns, numeric_cols
 
