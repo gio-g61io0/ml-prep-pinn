@@ -1,8 +1,21 @@
-
-
-
+import os
+import random
 import math
-import re
+
+import numpy as np
+
+
+def set_seed(seed=42):
+    """Set all random seeds for reproducible training.
+
+    Call before importing tensorflow in notebooks, or at the start of training functions.
+    """
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ['TF_DETERMINISTIC_OPS'] = '1'
+    random.seed(seed)
+    np.random.seed(seed)
+    import tensorflow as tf
+    tf.random.set_seed(seed)
 
 def calculate_t(conductivity, soil_thickness):
     return conductivity * soil_thickness
@@ -38,69 +51,54 @@ def classify_soil_texture(clay_pct, silt_pct, sand_pct):
     """
     c, si, sa = clay_pct, silt_pct, sand_pct
 
-    # --- High clay classes (check first) ---
-    # if c >= 40 and si >= 40:
-    #     return 'Silty Clay'
-    # if c >= 35 and sa >= 45:
-    #     return 'Sandy Clay'
-    # if c >= 40:
-    #     return 'Clay'
+    # High clay classes (check first)
+    if c >= 40 and si >= 40:
+        return 'Silty Clay'
+    if c >= 35 and sa >= 45:
+        return 'Sandy Clay'
+    if c >= 40:
+        return 'Clay'
 
-    # # --- Medium-high clay (27-40%) ---
-    # if c >= 27 and c < 40 and sa < 20:
-    #     return 'Silty Clay Loam'
-    # if c >= 27 and c < 40:
-    #     return 'Clay Loam'
+    # Medium-high clay (27-40%) — Sandy Clay Loam takes precedence over
+    # Clay Loam in the high-sand corner.
+    if 27 <= c < 40 and sa >= 45:
+        return 'Sandy Clay Loam'
+    if 27 <= c < 40 and sa < 20:
+        return 'Silty Clay Loam'
+    if 27 <= c < 40:
+        return 'Clay Loam'
 
-    # # --- Sandy Clay Loam: 20-35% clay, <28% silt, >=45% sand ---
-    # if c >= 20 and c < 35 and si < 28 and sa >= 45:
-    #     return 'Sandy Clay Loam'
+    # Sandy Clay Loam: 20-35% clay, <28% silt, >=45% sand
+    if 20 <= c < 35 and si < 28 and sa >= 45:
+        return 'Sandy Clay Loam'
 
-    # # --- High silt classes ---
-    # if si >= 80 and c < 12:
-    #     return 'Silt'
-    # if si >= 50 and c < 27:
-    #     return 'Silt Loam'
+    # High silt classes
+    if si >= 80 and c < 12:
+        return 'Silt'
+    if si >= 50 and c < 27:
+        return 'Silt Loam'
 
-    # # --- Sandy classes ---
-    # if sa >= 85 and c < 10:
-    #     return 'Sand'
-    # if sa >= 70 and sa < 90 and c < 15:
-    #     return 'Loamy Sand'
-    # if c < 20 and si < 50 and sa >= 43:
-    #     return 'Sandy Loam'
+    # Sandy classes
+    if sa >= 85 and c < 10:
+        return 'Sand'
+    if 70 <= sa < 90 and c < 15:
+        return 'Loamy Sand'
 
-    # # --- Loam: 7-27% clay, 28-50% silt, <=52% sand ---
-    # if c >= 7 and c < 27 and si >= 28 and si < 50 and sa <= 52:
-    #     return 'Loam'
+    # Loam: 7-27% clay, 28-50% silt, 23-52% sand. Checked before Sandy Loam
+    # because the two overlap in the c<20, 43<=sa<=52 corner.
+    if 7 <= c < 27 and 28 <= si < 50 and 23 <= sa <= 52:
+        return 'Loam'
 
-    # # Fallback
-    # if sa >= si and sa >= c:
-    #     return 'Sandy Loam'
-    # if si >= sa and si >= c:
-    #     return 'Silt Loam'
-    # return 'Loam'
+    # Sandy Loam (broader): 0-20% clay, 0-50% silt, 43-85% sand
+    if c < 20 and si < 50 and sa >= 43:
+        return 'Sandy Loam'
 
-
-    if abs((sa + si + c) - 100) > 0.1:
-        return "Invalid Percentages"
-
-    if c >= 40 and sa <= 45 and si <= 40:
-        return "Clay"
-    elif c >= 40 and sa > 45:
-        return "Sandy Clay"
-    elif c >= 40 and si > 40:
-        return "Silty Clay"
-    elif c >= 27 and c < 40 and sa > 45:
-        return "Sandy Clay Loam"
-    elif c >= 27 and c < 40 and sa <= 20 and si > 40:
-        return "Silty Clay Loam"
-    elif c >= 27 and c < 40 and sa <= 45 and sa > 20 and si <= 40:
-        return "Clay Loam"
-    elif c >= 12 and c < 27 and si < 28 and sa > 50:
-        return "Sandy Clay Loam" # Overlap handling
-    elif c >= 12 and c < 27 and si >= 28 and si < 50 and sa <= 52:
-        return "Loam"
+    # Fallback by dominant fraction
+    if sa >= si and sa >= c:
+        return 'Sandy Loam'
+    if si >= sa and si >= c:
+        return 'Silt Loam'
+    return 'Loam'
 
 def gkg_to_percent(value_gkg):
     """Convert g/kg to percentage: (g/kg / 1000) * 100."""

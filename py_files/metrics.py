@@ -1,14 +1,592 @@
 import numpy as np
+import pandas as pd
 import sklearn
-from matplotlib import path, pyplot as plt
+from matplotlib import pyplot as plt
 import matplotlib.colors as mcolors
 import contextily as cx
 import seaborn as sns
-from torch import norm
 from .data import dataframe_to_dataset
 import tensorflow as tf
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import (
+    confusion_matrix, brier_score_loss, precision_recall_curve,
+    average_precision_score,
+)
+from sklearn.calibration import calibration_curve
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+import rasterio
+from rasterio.features import rasterize as rio_rasterize
+from rasterio.transform import from_bounds
+
+def export_to_geopackage(gdf, layer_values, output_path):
+    """Attach value columns to a GeoDataFrame and write to GeoPackage.
+
+    Parameters
+    ----------
+    gdf : GeoDataFrame
+        Slope-unit polygons (must have geometry and CRS).
+    layer_values : dict
+        Mapping of ``{column_name: 1D array}`` where each array is aligned
+        with *gdf* rows (e.g. ``{"cohesion_kpa": cohesion, ...}``).
+    output_path : str or Path
+        Destination ``.gpkg`` file path.
+    """
+    out = gdf.copy()
+    for col_name, arr in layer_values.items():
+        out[col_name] = np.asarray(arr, dtype=np.float64)
+    out.to_file(output_path, driver="GPKG")
+    print(f"  Wrote {output_path}  ({len(out)} features, {list(layer_values.keys())})")
+
+
+def rasterize_to_geotiff(gdf, values, output_path, pixel_size=30.0, nodata=-9999.0, layer_name=None):
+    """Burn polygon values into a GeoTIFF raster.
+
+    Parameters
+    ----------
+    gdf : GeoDataFrame
+        Slope-unit polygons (must have a CRS set).
+    values : array-like
+        1-D array of values aligned with *gdf* rows.
+    output_path : str or Path
+        Destination .tif file path.
+    pixel_size : float
+        Output resolution in CRS units (default 30 m).
+    nodata : float
+        NoData fill value.
+    layer_name : str, optional
+        Band description written into the GeoTIFF metadata.
+    """
+    values = np.asarray(values, dtype=np.float64)
+
+    # Filter out empty / null geometries
+    mask = gdf.geometry.notnull() & ~gdf.geometry.is_empty
+    gdf_valid = gdf.loc[mask]
+    values_valid = values[mask.values]
+
+    minx, miny, maxx, maxy = gdf_valid.total_bounds
+    width = max(1, int(np.ceil((maxx - minx) / pixel_size)))
+    height = max(1, int(np.ceil((maxy - miny) / pixel_size)))
+
+    transform = from_bounds(minx, miny, maxx, maxy, width, height)
+
+    shapes = list(zip(gdf_valid.geometry, values_valid))
+
+    raster = rio_rasterize(
+        shapes,
+        out_shape=(height, width),
+        transform=transform,
+        fill=nodata,
+        dtype="float64",
+        all_touched=False,
+    )
+
+    profile = {
+        "driver": "GTiff",
+        "dtype": "float64",
+        "width": width,
+        "height": height,
+        "count": 1,
+        "crs": gdf_valid.crs,
+        "transform": transform,
+        "nodata": nodata,
+    }
+
+    with rasterio.open(output_path, "w", **profile) as dst:
+        dst.write(raster, 1)
+        if layer_name:
+            dst.set_band_description(1, layer_name)
+
+    print(f"  Wrote {output_path}  ({width}x{height} px)")
+
+
+def create_slope_unit_template(gdf, output_path, pixel_size=30.0, nodata=-1):
+    """Create a slope-unit ID raster from polygons.
+
+    Each pixel is assigned the row index (0-based) of the slope unit it
+    falls within.  This raster serves as a reusable template so that all
+    intermediate-output TIFs share the exact same grid, extent, and
+    slope-unit boundaries.
+
+    Parameters
+    ----------
+    gdf : GeoDataFrame
+        Slope-unit polygons (must have a CRS set).
+    output_path : str or Path
+        Destination .tif file for the template raster.
+    pixel_size : float
+        Output resolution in CRS units (default 30 m).
+    nodata : int
+        NoData fill value (default -1).
+
+    Returns
+    -------
+    str
+        The *output_path* that was written, for convenience.
+    """
+    mask = gdf.geometry.notnull() & ~gdf.geometry.is_empty
+    gdf_valid = gdf.loc[mask]
+
+    minx, miny, maxx, maxy = gdf_valid.total_bounds
+    width = max(1, int(np.ceil((maxx - minx) / pixel_size)))
+    height = max(1, int(np.ceil((maxy - miny) / pixel_size)))
+    transform = from_bounds(minx, miny, maxx, maxy, width, height)
+
+    # Burn the positional index of each slope unit into the raster
+    shapes = [(geom, idx) for idx, geom in enumerate(gdf_valid.geometry)]
+
+    id_raster = rio_rasterize(
+        shapes,
+        out_shape=(height, width),
+        transform=transform,
+        fill=nodata,
+        dtype="int32",
+        all_touched=False,
+    )
+
+    profile = {
+        "driver": "GTiff",
+        "dtype": "int32",
+        "width": width,
+        "height": height,
+        "count": 1,
+        "crs": gdf_valid.crs,
+        "transform": transform,
+        "nodata": nodata,
+    }
+
+    with rasterio.open(output_path, "w", **profile) as dst:
+        dst.write(id_raster, 1)
+        dst.set_band_description(1, "Slope Unit ID")
+
+    print(f"  Wrote slope-unit template {output_path}  ({width}x{height} px, "
+          f"{len(gdf_valid)} units)")
+    return output_path
+
+
+def rasterize_from_template(template_path, values, output_path,
+                            nodata=-9999.0, layer_name=None):
+    """Create a value GeoTIFF by mapping slope-unit IDs to values.
+
+    Reads the slope-unit ID template raster produced by
+    ``create_slope_unit_template`` and replaces each ID with the
+    corresponding value from *values*.
+
+    Parameters
+    ----------
+    template_path : str or Path
+        Path to the slope-unit ID template raster.
+    values : array-like
+        1-D array of values indexed by slope-unit ID.
+    output_path : str or Path
+        Destination .tif file path.
+    nodata : float
+        NoData fill value for pixels outside any slope unit.
+    layer_name : str, optional
+        Band description written into the GeoTIFF metadata.
+    """
+    values = np.asarray(values, dtype=np.float64)
+
+    with rasterio.open(template_path) as src:
+        id_raster = src.read(1)
+        template_nodata = src.nodata
+        profile = src.profile.copy()
+
+    # Build output: map each slope-unit ID to its value
+    out_raster = np.full(id_raster.shape, nodata, dtype=np.float64)
+    valid_mask = id_raster != template_nodata
+    ids = id_raster[valid_mask]
+    out_raster[valid_mask] = values[ids]
+
+    profile.update(dtype="float64", nodata=nodata)
+
+    with rasterio.open(output_path, "w", **profile) as dst:
+        dst.write(out_raster, 1)
+        if layer_name:
+            dst.set_band_description(1, layer_name)
+
+    print(f"  Wrote {output_path}  ({profile['width']}x{profile['height']} px)")
+
+
+## ---------------------------------------------------------------------------
+#  Statistical analysis & validation utilities
+# ---------------------------------------------------------------------------
+
+def plot_calibration(y_true, y_pred_probs, n_bins=10, title="Calibration Plot"):
+    """Reliability diagram: predicted probability vs observed frequency."""
+    fraction_pos, mean_pred = calibration_curve(y_true, y_pred_probs, n_bins=n_bins)
+    brier = brier_score_loss(y_true, y_pred_probs)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot([0, 1], [0, 1], "k--", label="Perfectly calibrated")
+    ax.plot(mean_pred, fraction_pos, "s-", label=f"Model (Brier={brier:.4f})")
+    ax.set_xlabel("Mean predicted probability")
+    ax.set_ylabel("Observed frequency")
+    ax.set_title(title)
+    ax.legend(loc="lower right")
+    plt.tight_layout()
+    plt.show()
+    return brier
+
+
+def plot_precision_recall(y_true, y_pred_probs, title="Precision-Recall Curve"):
+    """Precision-Recall curve with AUPR."""
+    precision, recall, _ = precision_recall_curve(y_true, y_pred_probs)
+    aupr = average_precision_score(y_true, y_pred_probs)
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(recall, precision, color="purple", label=f"AUPR={aupr:.3f}")
+    baseline = y_true.sum() / len(y_true)
+    ax.axhline(baseline, linestyle="--", color="gray", label=f"Baseline={baseline:.3f}")
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_title(title)
+    ax.legend(loc="upper right")
+    plt.tight_layout()
+    plt.show()
+    return aupr
+
+
+def success_rate_curve(y_true, y_pred_probs, title="Success Rate Curve"):
+    """Cumulative % of observed landslides captured vs % area (sorted by descending susceptibility)."""
+    y_true = np.asarray(y_true)
+    y_pred_probs = np.asarray(y_pred_probs).flatten()
+
+    order = np.argsort(-y_pred_probs)
+    sorted_labels = y_true[order]
+
+    cum_landslides = np.cumsum(sorted_labels)
+    total_landslides = sorted_labels.sum()
+    pct_landslides = cum_landslides / total_landslides if total_landslides > 0 else cum_landslides
+    pct_area = np.arange(1, len(y_true) + 1) / len(y_true)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(pct_area * 100, pct_landslides * 100, color="red", lw=2)
+    ax.plot([0, 100], [0, 100], "k--", label="Random model")
+    ax.set_xlabel("% of study area (sorted by susceptibility)")
+    ax.set_ylabel("% of observed landslides captured")
+    ax.set_title(title)
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # Report key thresholds
+    for pct in [10, 20, 30, 50]:
+        idx = int(len(y_true) * pct / 100) - 1
+        if idx >= 0:
+            print(f"  Top {pct}% area captures {pct_landslides[idx]*100:.1f}% of landslides")
+
+    return pct_area, pct_landslides
+
+
+def landslide_density_by_class(y_true, y_pred_probs, gdf=None,
+                               bins=None, labels=None):
+    """Observed landslide count (and density if areas available) per susceptibility bin."""
+    if bins is None:
+        bins = [0, 0.125, 0.375, 0.625, 0.875, 1.0]
+    if labels is None:
+        labels = ["Very Low", "Low", "Moderate", "High", "Very High"]
+
+    y_true = np.asarray(y_true)
+    y_pred_probs = np.asarray(y_pred_probs).flatten()
+    bin_idx = np.digitize(y_pred_probs, bins) - 1
+    bin_idx = np.clip(bin_idx, 0, len(labels) - 1)
+
+    rows = []
+    for i, label in enumerate(labels):
+        mask = bin_idx == i
+        n_units = mask.sum()
+        n_ls = y_true[mask].sum() if n_units > 0 else 0
+        area_km2 = None
+        if gdf is not None and n_units > 0:
+            area_km2 = gdf.loc[mask, "geometry"].area.sum() / 1e6
+        rows.append({
+            "class": label,
+            "n_slope_units": int(n_units),
+            "n_landslides": int(n_ls),
+            "ls_ratio": n_ls / n_units if n_units > 0 else 0,
+            "area_km2": area_km2,
+        })
+    result = pd.DataFrame(rows)
+    print(result.to_string(index=False))
+    return result
+
+
+def plot_intermediate_correlation(intermediates, method="spearman",
+                                  title="Intermediate Parameter Correlation"):
+    """Correlation heatmap of intermediate physics outputs and selected inputs.
+
+    Parameters
+    ----------
+    intermediates : dict
+        ``{name: 1-D array}`` — e.g. cohesion, ifi, fos, displacement, slope, pga.
+    """
+    corr_df = pd.DataFrame(intermediates).corr(method=method)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    sns.heatmap(corr_df, annot=True, fmt=".2f", cmap="coolwarm",
+                center=0, square=True, ax=ax)
+    ax.set_title(f"{title} ({method})")
+    plt.tight_layout()
+    plt.show()
+    return corr_df
+
+
+def plot_geotech_by_soil_type(values, soil_labels, value_name="Cohesion (kPa)",
+                              lit_ranges=None):
+    """Boxplot of a geotechnical parameter grouped by soil type.
+
+    Parameters
+    ----------
+    values : array-like
+        1-D predicted values (e.g. cohesion).
+    soil_labels : array-like
+        Soil type name per sample (same length as *values*).
+    lit_ranges : dict, optional
+        ``{soil_name: (min, max)}`` from literature for overlay.
+    """
+    tmp = pd.DataFrame({"value": np.asarray(values).flatten(),
+                        "soil": np.asarray(soil_labels)})
+    order = tmp.groupby("soil")["value"].median().sort_values().index
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    sns.boxplot(data=tmp, x="soil", y="value", order=order, ax=ax)
+
+    if lit_ranges:
+        for i, soil in enumerate(order):
+            if soil in lit_ranges:
+                lo, hi = lit_ranges[soil]
+                ax.hlines([lo, hi], i - 0.4, i + 0.4,
+                          colors="red", linestyles="dashed", linewidth=1)
+
+    ax.set_ylabel(value_name)
+    ax.set_xlabel("Soil Type")
+    ax.set_title(f"{value_name} by Soil Type")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_fold_stability(fold_values, param_name="Cohesion (kPa)"):
+    """Overlapping KDE plots comparing a parameter across folds.
+
+    Parameters
+    ----------
+    fold_values : list of arrays
+        Each element is the 1-D prediction array from one fold model.
+    """
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for i, vals in enumerate(fold_values):
+        sns.kdeplot(vals.flatten(), ax=ax, label=f"Fold {i+1}", fill=True, alpha=0.2)
+    ax.set_xlabel(param_name)
+    ax.set_title(f"Cross-fold stability: {param_name}")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def fold_ensemble_uncertainty(fold_predictions):
+    """Compute mean and std across fold predictions.
+
+    Parameters
+    ----------
+    fold_predictions : list of arrays
+        Each element is the 1-D susceptibility array from one fold model.
+
+    Returns
+    -------
+    mean_pred, std_pred : arrays
+    """
+    stacked = np.stack([p.flatten() for p in fold_predictions], axis=0)
+    return stacked.mean(axis=0), stacked.std(axis=0)
+
+
+## ---------------------------------------------------------------------------
+#  Incomplete-inventory validation: false-positive characterization
+# ---------------------------------------------------------------------------
+
+def classify_predictions(y_true, y_pred_probs, threshold=0.5):
+    """Partition samples into TP, FP, TN, FN groups.
+
+    Returns a 1-D array of category labels aligned with input arrays.
+    """
+    y_true = np.asarray(y_true).flatten()
+    y_pred = np.asarray(y_pred_probs).flatten()
+    cats = np.empty(len(y_true), dtype=object)
+    cats[(y_true == 1) & (y_pred >= threshold)] = "TP"
+    cats[(y_true == 0) & (y_pred >= threshold)] = "FP"
+    cats[(y_true == 1) & (y_pred < threshold)]  = "FN"
+    cats[(y_true == 0) & (y_pred < threshold)]  = "TN"
+    return cats
+
+
+def false_positive_analysis(gdf, y_pred_probs, feature_cols, threshold=0.5,
+                            label_col="landslide"):
+    """Compare feature distributions of TP vs FP vs TN.
+
+    If false positives share geomorphological characteristics with true
+    positives (and differ from true negatives), the model is likely
+    identifying genuinely susceptible areas that are missing from an
+    incomplete inventory.
+
+    Parameters
+    ----------
+    gdf : GeoDataFrame
+        Must contain *label_col* and all *feature_cols*.
+    y_pred_probs : array-like
+        Predicted susceptibility (0-1).
+    feature_cols : list of str
+        Features to compare (e.g. Slope_mean, Elev_mean, Prc_mean, …).
+    threshold : float
+        Classification threshold.
+
+    Returns
+    -------
+    summary : DataFrame
+        Mean feature values per group (TP, FP, TN, FN).
+    cats : array
+        Per-sample category labels.
+    """
+    y_true = gdf[label_col].values
+    cats = classify_predictions(y_true, y_pred_probs, threshold)
+
+    tmp = gdf[feature_cols].copy()
+    tmp["_group"] = cats
+    summary = tmp.groupby("_group")[feature_cols].agg(["mean", "std"])
+
+    # Print concise table
+    means = tmp.groupby("_group")[feature_cols].mean()
+    counts = tmp["_group"].value_counts()
+    print("Sample counts per group:")
+    print(counts.to_string())
+    print("\nMean feature values by group:")
+    print(means.round(4).to_string())
+    return summary, cats
+
+
+def plot_fp_vs_tp_distributions(gdf, cats, feature_cols, ncols=3):
+    """KDE plots comparing TP, FP, TN distributions for key features.
+
+    Overlapping TP and FP distributions (both distinct from TN) indicate
+    the model is generalizing to genuinely susceptible unlabeled areas.
+    """
+    groups_to_plot = ["TP", "FP", "TN"]
+    colors = {"TP": "red", "FP": "orange", "TN": "steelblue", "FN": "gray"}
+
+    n = len(feature_cols)
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4 * nrows))
+    axes = np.atleast_2d(axes)
+    axes_flat = axes.flatten()
+
+    for i, col in enumerate(feature_cols):
+        ax = axes_flat[i]
+        for grp in groups_to_plot:
+            mask = cats == grp
+            if mask.sum() == 0:
+                continue
+            vals = gdf.loc[mask, col].dropna()
+            if len(vals) > 1:
+                sns.kdeplot(vals, ax=ax, label=grp, color=colors[grp],
+                            fill=True, alpha=0.2)
+        ax.set_title(col)
+        ax.legend(fontsize=8)
+
+    for j in range(n, len(axes_flat)):
+        axes_flat[j].set_visible(False)
+
+    fig.suptitle("Feature Distributions: TP vs FP vs TN", fontsize=14)
+    fig.tight_layout()
+    plt.show()
+
+
+def fp_tp_statistical_tests(gdf, cats, feature_cols):
+    """Mann-Whitney U tests comparing FP vs TP and FP vs TN for each feature.
+
+    A non-significant FP-vs-TP test (high p-value) means false positives
+    are statistically similar to true positives — evidence that the model
+    is finding real susceptible areas missing from the inventory.
+
+    A significant FP-vs-TN test (low p-value) means false positives are
+    distinct from true negatives — they aren't random noise.
+
+    Returns a DataFrame with test statistics and p-values.
+    """
+    from scipy.stats import mannwhitneyu
+
+    rows = []
+    for col in feature_cols:
+        tp_vals = gdf.loc[cats == "TP", col].dropna()
+        fp_vals = gdf.loc[cats == "FP", col].dropna()
+        tn_vals = gdf.loc[cats == "TN", col].dropna()
+
+        fp_tp_stat, fp_tp_p = (np.nan, np.nan)
+        fp_tn_stat, fp_tn_p = (np.nan, np.nan)
+
+        if len(fp_vals) > 0 and len(tp_vals) > 0:
+            fp_tp_stat, fp_tp_p = mannwhitneyu(fp_vals, tp_vals, alternative="two-sided")
+        if len(fp_vals) > 0 and len(tn_vals) > 0:
+            fp_tn_stat, fp_tn_p = mannwhitneyu(fp_vals, tn_vals, alternative="two-sided")
+
+        rows.append({
+            "feature": col,
+            "FP_vs_TP_U": fp_tp_stat,
+            "FP_vs_TP_p": fp_tp_p,
+            "FP_similar_to_TP": "Yes" if fp_tp_p > 0.05 else "No",
+            "FP_vs_TN_U": fp_tn_stat,
+            "FP_vs_TN_p": fp_tn_p,
+            "FP_differs_from_TN": "Yes" if fp_tn_p < 0.05 else "No",
+        })
+
+    result = pd.DataFrame(rows)
+    print("\nMann-Whitney U tests (FP characterization):")
+    print(result.to_string(index=False))
+    print("\nInterpretation:")
+    print("  FP similar to TP (p>0.05)  = model finds areas like known landslides")
+    print("  FP differs from TN (p<0.05) = false positives are NOT random noise")
+    return result
+
+
+def plot_fp_map(gdf, cats, title="Spatial Distribution of Prediction Groups"):
+    """Map showing TP, FP, TN, FN locations."""
+    color_map = {"TP": "red", "FP": "orange", "TN": "lightblue", "FN": "gray"}
+    plot_order = ["TN", "FN", "FP", "TP"]
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    for grp in plot_order:
+        mask = cats == grp
+        if mask.sum() == 0:
+            continue
+        gdf.loc[mask].plot(ax=ax, color=color_map[grp], label=grp, alpha=0.6)
+
+    ax.legend(title="Group", loc="upper right")
+    ax.set_title(title)
+    ax.set_axis_off()
+    try:
+        cx.add_basemap(ax, crs=gdf.crs.to_string(),
+                       source=cx.providers.CartoDB.Positron)
+    except Exception as e:
+        print(f"  basemap unavailable: {e}")
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_fp_susceptibility_histogram(y_pred_probs, cats,
+                                     title="Susceptibility Distribution by Group"):
+    """Histogram of predicted susceptibility split by TP/FP/TN/FN."""
+    colors = {"TP": "red", "FP": "orange", "TN": "steelblue", "FN": "gray"}
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for grp in ["TN", "FP", "TP"]:
+        mask = cats == grp
+        if mask.sum() == 0:
+            continue
+        ax.hist(np.asarray(y_pred_probs).flatten()[mask], bins=50,
+                alpha=0.4, label=grp, color=colors[grp])
+    ax.set_xlabel("Predicted Susceptibility")
+    ax.set_ylabel("Count")
+    ax.set_title(title)
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
 
 def plot_confusion_matrix(preds, test_y):
     y_pred_classes = (preds > 0.5).astype("int32")
@@ -29,10 +607,8 @@ def find_best_threshold(y_true, y_pred_probs):
 
 
 def plot_distribution(df, title, x_label, y_label, label):
-    #Plotting the distribution of bulk unit mean
-    ax =sns.histplot(df[label], bins=30, kde=True, color="red")
+    sns.histplot(df[label], bins=30, kde=True, color="red")
     plt.title(title)
-    # plt.axvline(np.mean(df[label]), color=)
     plt.xlabel(x_label)
     plt.ylabel(y_label)
     plt.show()
@@ -66,13 +642,13 @@ def plot_predicted_observed_map(gdf, predicted_col, observed_col):
     plt.show()
 
 def plot_susceptibility_map(gdf, predictions, label_name, title="PINN Susceptibility Map"):
-    gdf[f'predicted_susceptibility'] = predictions
+    gdf['predicted_susceptibility'] = predictions
     norm = mcolors.Normalize(vmin=0, vmax=1.0)
 
     fig, ax = plt.subplots(1, 1, figsize=(8, 7))
 
     # Remove legend=True here
-    gdf.plot(column=f'predicted_susceptibility', cmap='plasma_r', ax=ax, norm=norm)
+    gdf.plot(column='predicted_susceptibility', cmap='plasma_r', ax=ax, norm=norm)
     # gdf.plot(column=f'Landslide', cmap='plasma_r', ax=ax, norm=norm)
 
     # Add single custom colorbar
@@ -203,11 +779,73 @@ def calculate_distribution(df, column = 'predicted_susceptibility'):
         "0.875":0,
         "1.0":0
     }
-    for range in ranges:
-        count = df[(df[column] > range[0]) & (df[column] < range[1])].shape[0]
-        range_values[str(range[1])] = count
+    for bin_range in ranges:
+        count = df[(df[column] > bin_range[0]) & (df[column] < bin_range[1])].shape[0]
+        range_values[str(bin_range[1])] = count
         
     return range_values
+
+def compute_shap_values(model, df, feature_cols, n_background=200, n_explain=500):
+    """Compute SHAP values for a PINN model with dict-based inputs.
+
+    Handles string categorical columns (e.g. 'type') by encoding them as
+    integer codes for SHAP and decoding back to strings in the predict wrapper.
+
+    Returns (shap_values, explain_data, feature_cols).
+    """
+    import shap
+    import pandas as pd
+
+    # Identify string columns and encode as integers
+    string_cols = df[feature_cols].select_dtypes(include='object').columns.tolist()
+    category_maps = {}  # col -> {int_code: string_value}
+
+    df_numeric = df[feature_cols].copy()
+    for col in string_cols:
+        codes, uniques = pd.factorize(df_numeric[col])
+        df_numeric[col] = codes.astype(float)
+        category_maps[col] = dict(enumerate(uniques))
+
+    data_array = df_numeric.values.astype(np.float64)
+
+    # Sample background and explanation sets
+    rng = np.random.default_rng(42)
+    n_bg = min(n_background, len(data_array))
+    n_ex = min(n_explain, len(data_array))
+    bg_idx = rng.choice(len(data_array), size=n_bg, replace=False)
+    ex_idx = rng.choice(len(data_array), size=n_ex, replace=False)
+    background = data_array[bg_idx]
+    explain = data_array[ex_idx]
+
+    def predict_fn(X):
+        input_dict = {}
+        for i, col in enumerate(feature_cols):
+            if col in string_cols:
+                int_codes = np.round(X[:, i]).astype(int)
+                int_codes = np.clip(int_codes, 0, max(category_maps[col].keys()))
+                str_vals = np.array([category_maps[col].get(c, category_maps[col][0]) for c in int_codes])
+                input_dict[col] = str_vals
+            else:
+                input_dict[col] = X[:, i].astype(np.float32)
+        ds = tf.data.Dataset.from_tensor_slices(input_dict).batch(256)
+        # Ensure each feature is 2D (n, 1) as the model expects
+        ds = ds.map(lambda d: {k: tf.expand_dims(v, -1) if tf.rank(v) == 1 else v for k, v in d.items()})
+        preds = model.predict(ds, verbose=0)
+        return preds.flatten()
+
+    explainer = shap.KernelExplainer(predict_fn, background)
+    shap_values = explainer.shap_values(explain)
+
+    return shap_values, explain, feature_cols
+
+
+def plot_shap_summary(shap_values, feature_data, feature_names):
+    """Plot SHAP beeswarm and bar summary plots."""
+    import shap
+
+    shap.summary_plot(shap_values, feature_data, feature_names=feature_names)
+    shap.summary_plot(shap_values, feature_data, feature_names=feature_names, plot_type="bar")
+
 
 class OrdinalAccuracy(tf.keras.metrics.Metric):
     def __init__(self, name="ordinal_acc", **kwargs):
@@ -222,5 +860,5 @@ class OrdinalAccuracy(tf.keras.metrics.Metric):
     def result(self):
         return self.acc.result()
 
-    def reset_states(self):
-        self.acc.reset_states()
+    def reset_state(self):
+        self.acc.reset_state()

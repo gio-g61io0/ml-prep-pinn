@@ -1,4 +1,3 @@
-from os import name
 from sklearn.model_selection import StratifiedKFold
 import numpy as np
 import tensorflow as tf
@@ -24,10 +23,15 @@ def train_model_rainfall_v3(df, numerical_cols, categorical_cols, feature_cols, 
     aucs, tprs = [], []
     fold = 1
 
+    class_weight = {0: 1, 1: 5}
+
     for train_idx, val_idx in skf.split(df, df['landslide']):
         train_df, val_df = df.iloc[train_idx], df.iloc[val_idx]
         pga_input, soil_idx_input = None, None
 
+        # Single-label dataset is used to adapt normalizers (NormalizationLayer
+        # iterates `(features, labels)`); the multi-output wrapper is only
+        # passed to `fit`/`predict`.
         train_ds = dataframe_to_dataset(train_df[feature_cols], batch_size=batch_size)
         val_ds = dataframe_to_dataset(val_df[feature_cols], shuffle=False, batch_size=batch_size)
 
@@ -59,39 +63,48 @@ def train_model_rainfall_v3(df, numerical_cols, categorical_cols, feature_cols, 
             encoded_inputs.append(encoded_cat)
 
         if pga_input is None:
-            raise Exception("PGA input is none")
+            raise ValueError("PGA input is none")
 
-        print(all_inputs)
         model = LandslideRainFallV3()
         model.classification_model(all_inputs, pga_input, soil_idx_input, encoded_inputs)
         model.get_optimizer()
         model.compile_model_dce()
 
+        # Wrap into dual-head datasets with per-sample weights (multi-output
+        # models don't support the class_weight kwarg of fit()).
+        train_ds_mo = LandslideRainFallV3.to_multi_output_ds(train_ds, class_weight=class_weight)
+        val_ds_mo = LandslideRainFallV3.to_multi_output_ds(val_ds)
+
         model_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
             f"{path}/fold-{fold}-model-v3.keras",
+            monitor="val_final_head_auc",
             save_best_only=True,
             save_weights_only=False,
             mode="max",
             save_freq="epoch",
-            verbose=0
+            verbose=0,
         )
 
-        hist = model.model.fit(
-            train_ds,
+        model.model.fit(
+            train_ds_mo,
             epochs=epochs,
             batch_size=batch_size,
-            validation_data=val_ds,
-            class_weight={0: 1, 1: 5},
+            validation_data=val_ds_mo,
             callbacks=[
-                tf.keras.callbacks.EarlyStopping(monitor='loss', patience=5, restore_best_weights=True),
+                tf.keras.callbacks.EarlyStopping(
+                    monitor="val_final_head_auc",
+                    mode="max",
+                    patience=5,
+                    restore_best_weights=True,
+                ),
                 model_checkpoint_callback,
-            ]
+            ],
         )
         y_true = val_df['landslide']
-        validation_preds = model.model.predict(val_ds)
-        predictions[val_idx] = validation_preds.flatten()
+        validation_preds = model.model.predict(val_ds_mo)["final_head"].flatten()
+        predictions[val_idx] = validation_preds
 
-        fpr, tpr, thresholds = sklearn.metrics.roc_curve(y_true, validation_preds)
+        fpr, tpr, _ = sklearn.metrics.roc_curve(y_true, validation_preds)
         auc = sklearn.metrics.auc(fpr, tpr)
         aucs.append(auc)
         interp_tpr = np.interp(mean_fpr, fpr, tpr)

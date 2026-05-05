@@ -1,3 +1,10 @@
 datasets/
 venv/
 CLAUDE.md
+article_cache/
+gdelt*
+mnews*
+output*
+data-collection/
+geotech_rasters/
+image_outputs/

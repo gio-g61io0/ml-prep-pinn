@@ -1,7 +1,7 @@
 import tensorflow as tf
 from tensorflow.keras import layers, Model, optimizers, metrics, losses
 from py_files.GallenModel import CriticalAcceleration, DisplacementIntermediate, FosLayer
-from py_files.GallenModel_v1 import DisplacementLayerRainFall, NewmarkActivation, WetnessLayer, ClipLayer, CohesionLayer, InternalFrictionLayer
+from py_files.GallenModel_v1 import DisplacementLayerRainFall, NewmarkActivation, WetnessLayer, CohesionLayer, InternalFrictionLayer
 from py_files.GallenModel_v3 import HydraulicConductivityLayerV3
 from py_files.Landslidev2_Old import DiceCrossEntropyLoss
 
@@ -26,8 +26,26 @@ numeric_cols = ['Clay_mean',
   'BUK_mean',
   'ContributingFactor_mean',
   'type',
-  'soil_type_idx',
+  'soil_texture_idx',
   ]
+
+
+@tf.keras.utils.register_keras_serializable()
+class LogitLayer(tf.keras.layers.Layer):
+    """Numerically stable logit: log(p / (1 - p)) with clipping."""
+    def __init__(self, eps=1e-6, **kwargs):
+        super().__init__(**kwargs)
+        self.eps = eps
+
+    def call(self, p):
+        p_clip = tf.clip_by_value(p, self.eps, 1.0 - self.eps)
+        return tf.math.log(p_clip) - tf.math.log(1.0 - p_clip)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"eps": self.eps})
+        return config
+
 
 class LandslideRainFallV3():
     """Rainfall PINN model v3 with 12 USDA soil texture classes.
@@ -37,19 +55,32 @@ class LandslideRainFallV3():
     2. HydraulicConductivityLayerV3 with 12 USDA soil types for wetness only.
     3. Soil type index derived from USDA texture classification of
        clay/silt/sand g/kg values rather than the 'type' column.
+    4. Hybrid output: additive-logit residual + auxiliary physics_prob
+       supervision to prevent physics collapse.
     """
 
-    def __init__(self, depth=8):
+    def __init__(self, depth=8, aux_weight=0.3):
         self.depth = depth
+        self.aux_weight = aux_weight
 
     def classification_model(self, all_inputs, pga_input, soil_idx_input, encoded_features):
         """
             Builds the graph for PINN Model v3
             Unconstrained coh/ifi + soil-conditioned K for wetness
+            Additive-logit hybrid head + auxiliary physics_prob output
         """
         units = [32, 64, 8, 64, 32, 8, 32, 8]
         all_features = tf.keras.layers.concatenate(encoded_features)
         features_only = all_features
+
+        # Geotechnical MLP must NOT see Prc_mean — rainfall reaches FOS only through
+        # WetnessLayer → m → DisplacementLayerRainFall. Without this cut, the Dense head
+        # learns a shortcut (Prc → coh/IFI) that bypasses the physics and fails to
+        # generalize to gentle-slope, high-rainfall pixels (the FN cluster).
+        prc_idx = numeric_cols.index("Prc_mean")
+        geotech_features = tf.keras.layers.concatenate(
+            [f for i, f in enumerate(encoded_features) if i != prc_idx]
+        )
 
         slope = all_inputs[numeric_cols.index("Slope_mean")]
         bulk_unit_weight = all_inputs[numeric_cols.index("BUK_mean")]
@@ -62,7 +93,7 @@ class LandslideRainFallV3():
             name="Sus_0",
             kernel_initializer="random_normal",
             bias_initializer="random_normal",
-        )(features_only)
+        )(geotech_features)
 
         for i in range(1, self.depth + 1):
             x = layers.Dense(
@@ -85,38 +116,104 @@ class LandslideRainFallV3():
         # Soil-conditioned K for wetness only
         k = HydraulicConductivityLayerV3()(soil_idx_input)
         m = WetnessLayer()([precipitation, contributing_area, soil_thickness, slope, k])
-        m = ClipLayer(0, 0.7, name="m_clip")(m)
-
+        # m = ClipLayer(0, 0.7, name="m_clip")(m)
+        m = layers.Activation("sigmoid", name="m_clip")(m)
         ds, fos, critical_acceleration, acpg = DisplacementLayerRainFall()([coh, ifi, slope, pga_input, bulk_unit_weight, m])
         fos = FosLayer()(fos)
         ac, acpg = CriticalAcceleration()(critical_acceleration, acpg)
         ds = DisplacementIntermediate()(ds)
 
-        sus = NewmarkActivation(threshold=2.0)(ds, fos, ac, acpg)
-        self.model = Model(inputs=all_inputs + [pga_input, soil_idx_input], outputs=sus)
+        # Physics-only probability (auxiliary output)
+        physics_prob = NewmarkActivation(threshold=2.0, name="physics_prob")(ds, fos, ac, acpg)
 
-    def get_optimizer(self, lr=1e-05):
+        # Residual DNN branch (unregularized; allows symmetric corrections)
+        res = layers.Dense(
+            16,
+            name="residual_dense1",
+            kernel_initializer="random_normal",
+            bias_initializer="random_normal",
+        )(features_only)
+        res = layers.LeakyReLU(negative_slope=0.2)(res)
+        res = layers.Dense(
+            1,
+            name="residual_dense2",
+            kernel_initializer="random_normal",
+            bias_initializer="random_normal",
+        )(res)
+
+        # Option A: additive residual in logit space
+        # final_logit = logit(physics_prob) + residual
+        physics_logit = LogitLayer(name="physics_logit")(physics_prob)
+        combined_logit = layers.Add(name="combined_logit")([physics_logit, res])
+        final = layers.Activation("sigmoid", name="final_head")(combined_logit)
+
+        # Option B: multi-output for auxiliary supervision on physics_prob
+        self.model = Model(
+            inputs=all_inputs + [pga_input, soil_idx_input],
+            outputs={"final_head": final, "physics_prob": physics_prob},
+        )
+
+    @staticmethod
+    def to_multi_output_ds(ds, class_weight=None):
+        """Replicate single-label dataset into dict labels for dual-head training.
+
+        If class_weight is provided (e.g. {0: 1, 1: 5}) the dataset also emits
+        per-sample weights, which is the multi-output-safe substitute for the
+        `class_weight` kwarg of `fit()` (that kwarg is not supported with
+        multi-output models).
+        """
+        if class_weight is None:
+            return ds.map(lambda x, y: (x, {"final_head": y, "physics_prob": y}))
+
+        w0 = tf.constant(float(class_weight[0]), dtype=tf.float32)
+        w1 = tf.constant(float(class_weight[1]), dtype=tf.float32)
+
+        def _attach(x, y):
+            y_f = tf.cast(y, tf.float32)
+            sw = y_f * w1 + (1.0 - y_f) * w0
+            return (
+                x,
+                {"final_head": y, "physics_prob": y},
+                {"final_head": sw, "physics_prob": sw},
+            )
+
+        return ds.map(_attach)
+
+    def get_optimizer(self, lr=1e-4):
         self.optimizer_instance = optimizers.Adam(learning_rate=lr)
 
     def compile_model_dce(self):
-        dce_loss = DiceCrossEntropyLoss()
         self.model.compile(
             optimizer=self.optimizer_instance,
-            loss=dce_loss,
-            metrics=[
-                metrics.BinaryIoU(target_class_ids=[0,1], threshold=0.5),
-                metrics.AUC(),
-                "accuracy",
-            ],
+            loss={
+                "final_head": DiceCrossEntropyLoss(),
+                "physics_prob": losses.BinaryCrossentropy(),
+            },
+            loss_weights={"final_head": 1.0, "physics_prob": self.aux_weight},
+            metrics={
+                "final_head": [
+                    metrics.BinaryIoU(target_class_ids=[0, 1], threshold=0.5),
+                    metrics.AUC(name="auc"),
+                    "accuracy",
+                ],
+                "physics_prob": [metrics.AUC(name="auc")],
+            },
         )
 
     def compile_model_bce(self):
         self.model.compile(
             optimizer=self.optimizer_instance,
-            loss=losses.BinaryCrossentropy(),
-            metrics=[
-                metrics.BinaryIoU(target_class_ids=[0,1], threshold=0.5),
-                metrics.AUC(),
-                "accuracy",
-            ],
+            loss={
+                "final_head": losses.BinaryCrossentropy(),
+                "physics_prob": losses.BinaryCrossentropy(),
+            },
+            loss_weights={"final_head": 1.0, "physics_prob": self.aux_weight},
+            metrics={
+                "final_head": [
+                    metrics.BinaryIoU(target_class_ids=[0, 1], threshold=0.5),
+                    metrics.AUC(name="auc"),
+                    "accuracy",
+                ],
+                "physics_prob": [metrics.AUC(name="auc")],
+            },
         )
