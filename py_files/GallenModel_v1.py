@@ -70,7 +70,7 @@ class DisplacementLayerRainFall(tf.keras.layers.Layer):
         m = tf.reshape(m, [-1])          # flatten to (batch,) in case it arrives as (batch,1)
         m = tf.expand_dims(m, 1)
 
-        water_unit_weight = 9.81 #This is 9.81 N/m^3
+        water_unit_weight = 9810.0 #This is 9.81 N/m^3
        
         safety_factor = (cohesion_t / ((bulk_density * slope_normal_thickness) * tf.math.sin(slope))) + (tf.math.tan(friction_angle) / tf.math.tan(slope)) - ((m * water_unit_weight * tf.math.tan(friction_angle)) / (bulk_density * tf.math.tan(slope)))
 
@@ -81,7 +81,13 @@ class DisplacementLayerRainFall(tf.keras.layers.Layer):
         ac = layers.ReLU()(ac)
 
         acpg = ac / pga
-        acpg = tf.clip_by_value(acpg, 0.001, 0.75)
+        # acpg = a_c / PGA. Low values mean slope yields easily (high displacement),
+        # high values mean slope barely yields (low displacement).
+        # Lower bound 0.05 -> caps max displacement at ~135 cm (physically realistic
+        # for severe landslides; previous 0.001 lower bound let it explode to ~42,500 cm
+        # at the Jibson regression singularity).
+        # Upper bound 0.75 -> stable slopes can still go down to ~0.12 cm displacement.
+        acpg = tf.clip_by_value(acpg, 0.05, 0.75)
 
         powcomp = tf.math.pow((1 - acpg), 2.341) * tf.math.pow(acpg, -1.438)
         logds = 0.215 + tf.math.log(powcomp) + 0.51  # NOTE:: Newmark Displacement
@@ -269,14 +275,34 @@ class HydraulicConductivityLayer(tf.keras.layers.Layer):
 
 @tf.keras.utils.register_keras_serializable()
 class WetnessLayer(tf.keras.layers.Layer):
-    """Computes empirical wetness m = (R * α) / (T * sin θ), clamped to [0, 1].
+    """Computes empirical wetness m = λ * (R * A) / (T * sin θ), clamped to [0, 1].
 
     Input: [precipitation (mm/month), contributing_area (m²), soil_thickness (m), slope (deg), k (m/hr)]
     Output: m ∈ [0, 1]
+
+    The learnable scale factor λ ∈ [lambda_min, lambda_max] (default [0.01, 1.0]) lets
+    the model calibrate the formula to avoid saturation at m=1. With raw contributing
+    area in m² (often 1e3-1e4) the unmodified formula tends to produce m >> 1 for most
+    pixels and clips to 1; the scale factor absorbs the unit/scale mismatch.
     """
-    def __init__(self, **kwargs):
+    def __init__(self, lambda_min=0.01, lambda_max=1.0, u_lambda_init=-2.0, **kwargs):
         kwargs.setdefault("name", "wetness_layer")
         super(WetnessLayer, self).__init__(**kwargs)
+        self.lambda_min = lambda_min
+        self.lambda_max = lambda_max
+        self.u_lambda_init = u_lambda_init
+
+    def build(self, input_shape):
+        # Single learnable scalar; sigmoid(u_lambda) is rescaled into [lambda_min, lambda_max].
+        # Default u_lambda_init = -2 -> sigmoid(-2) ≈ 0.12 -> lambda ≈ 0.13 with default bounds,
+        # which puts the median pixel's pre-clip m at ~0.3 instead of >2 (saturated).
+        self.u_lambda = self.add_weight(
+            name="u_lambda",
+            shape=(),
+            initializer=tf.keras.initializers.Constant(self.u_lambda_init),
+            trainable=True,
+        )
+        super().build(input_shape)
 
     def call(self, inputs):
         precipitation, contributing_area, soil_thickness, slope, k = (
@@ -293,13 +319,20 @@ class WetnessLayer(tf.keras.layers.Layer):
         t = k * soil_thickness
         t = tf.maximum(t, 1e-10)
         sin_slope = tf.maximum(tf.math.sin(slope_rad), 1e-6)
+        # Learnable scale, bounded via sigmoid into [lambda_min, lambda_max]
+        scale = self.lambda_min + (self.lambda_max - self.lambda_min) * tf.nn.sigmoid(self.u_lambda)
         # Wetness ratio
-        m = (r * contributing_area) / (t * sin_slope)
+        m = scale * (r * contributing_area) / (t * sin_slope)
         m = tf.clip_by_value(m, 0.0, 1.0)
         return m
 
     def get_config(self):
         config = super().get_config()
+        config.update({
+            "lambda_min": self.lambda_min,
+            "lambda_max": self.lambda_max,
+            "u_lambda_init": self.u_lambda_init,
+        })
         return config
 
     @classmethod

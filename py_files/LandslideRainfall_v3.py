@@ -137,15 +137,18 @@ class LandslideRainFallV3():
         # Soil-conditioned K for wetness only
         k = HydraulicConductivityLayerV3()(soil_idx_input)
         m = WetnessLayer()([precipitation, contributing_area, soil_thickness, slope, k])
-        # m = ClipLayer(0, 0.7, name="m_clip")(m)
-        m = layers.Activation("sigmoid", name="m_clip")(m)
+        # WetnessLayer already clips m to [0, 1]; pass through a linear "Activation"
+        # only to preserve the "m_clip" layer name for downstream diagnostic code.
+        # The previous sigmoid here was a bug: sigmoid([0,1]) -> [0.5, 0.731], which
+        # compressed physical wetness variation and blocked the gradient to K.
+        m = layers.Activation("linear", name="m_clip")(m)
         ds, fos, critical_acceleration, acpg = DisplacementLayerRainFall()([coh, ifi, slope, pga_input, bulk_unit_weight, m])
         fos = FosLayer()(fos)
         ac, acpg = CriticalAcceleration()(critical_acceleration, acpg)
         ds = DisplacementIntermediate()(ds)
 
         # Physics-only probability (auxiliary output)
-        physics_prob = NewmarkActivation(threshold=0.5, name="physics_prob")(ds, fos, ac, acpg)
+        physics_prob = NewmarkActivation(threshold=20, name="physics_prob")(ds, fos, ac, acpg)
 
         # Residual DNN branch (unregularized; allows symmetric corrections)
         res = layers.Dense(
