@@ -68,7 +68,7 @@ class LandslideRainFallV3():
        supervision to prevent physics collapse.
     """
 
-    def __init__(self, depth=8, aux_weight=0.7, residual_scale=2.0):
+    def __init__(self, depth=8, aux_weight=0.7, residual_scale=3.0):
         self.depth = depth
         self.aux_weight = aux_weight
         # Caps the residual head in logit space: residual = scale * tanh(dense_out)
@@ -145,7 +145,7 @@ class LandslideRainFallV3():
         ds = DisplacementIntermediate()(ds)
 
         # Physics-only probability (auxiliary output)
-        physics_prob = NewmarkActivation(threshold=5.0, name="physics_prob")(ds, fos, ac, acpg)
+        physics_prob = NewmarkActivation(threshold=0.5, name="physics_prob")(ds, fos, ac, acpg)
 
         # Residual DNN branch (unregularized; allows symmetric corrections)
         res = layers.Dense(
