@@ -8,3 +8,6 @@ output*
 data-collection/
 geotech_rasters/
 image_outputs/
+docs/
+feature_manifests/
+eda_outputs/

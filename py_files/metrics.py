@@ -785,20 +785,53 @@ def calculate_distribution(df, column = 'predicted_susceptibility'):
         
     return range_values
 
-def compute_shap_values(model, df, feature_cols, n_background=200, n_explain=500):
-    """Compute SHAP values for a PINN model with dict-based inputs.
+def compute_shap_values(
+    model, df, feature_cols, n_background=200, n_explain=500,
+    categorical_cols=None,
+):
+    """Compute SHAP values for a Keras model with dict-based string/numeric inputs.
 
-    Handles string categorical columns (e.g. 'type') by encoding them as
-    integer codes for SHAP and decoding back to strings in the predict wrapper.
+    Two modes for string-valued categorical columns:
 
-    Returns (shap_values, explain_data, feature_cols).
+    1. ``categorical_cols=None`` (default, back-compat):
+       Each string column is integer-encoded via ``pd.factorize`` and SHAP
+       sees a single float feature per column. The Shapley value answers
+       "how much does this row's category contribute vs the background's
+       category distribution". Magnitudes are valid; beeswarm color (integer
+       code on a continuous scale) is not.
+
+    2. ``categorical_cols=['type', ...]``:
+       Each listed column is one-hot expanded into ``{col}__{value}`` dummies
+       before SHAP. The predict wrapper argmax-decodes each dummy block back
+       to the original string before calling the model. Returns SHAP values
+       in the *expanded* feature space; use ``aggregate_categorical_shap`` to
+       collapse the dummies back to a single SHAP column per original
+       categorical feature (preserving SHAP's additive property by summing
+       signed dummy SHAP values).
+
+    Returns ``(shap_values, explain_data, feature_names)`` where the shape
+    of ``shap_values`` and ``feature_names`` reflects whichever mode was used.
     """
     import shap
     import pandas as pd
 
-    # Identify string columns and encode as integers
+    if categorical_cols is None:
+        return _compute_shap_integer_coded(
+            model, df, feature_cols, n_background, n_explain,
+        )
+
+    return _compute_shap_one_hot(
+        model, df, feature_cols, categorical_cols, n_background, n_explain,
+    )
+
+
+def _compute_shap_integer_coded(model, df, feature_cols, n_background, n_explain):
+    """Original (back-compat) path: integer-encode each string column."""
+    import shap
+    import pandas as pd
+
     string_cols = df[feature_cols].select_dtypes(include='object').columns.tolist()
-    category_maps = {}  # col -> {int_code: string_value}
+    category_maps = {}
 
     df_numeric = df[feature_cols].copy()
     for col in string_cols:
@@ -808,7 +841,6 @@ def compute_shap_values(model, df, feature_cols, n_background=200, n_explain=500
 
     data_array = df_numeric.values.astype(np.float64)
 
-    # Sample background and explanation sets
     rng = np.random.default_rng(42)
     n_bg = min(n_background, len(data_array))
     n_ex = min(n_explain, len(data_array))
@@ -828,15 +860,176 @@ def compute_shap_values(model, df, feature_cols, n_background=200, n_explain=500
             else:
                 input_dict[col] = X[:, i].astype(np.float32)
         ds = tf.data.Dataset.from_tensor_slices(input_dict).batch(256)
-        # Ensure each feature is 2D (n, 1) as the model expects
         ds = ds.map(lambda d: {k: tf.expand_dims(v, -1) if tf.rank(v) == 1 else v for k, v in d.items()})
         preds = model.predict(ds, verbose=0)
-        return preds.flatten()
+        if isinstance(preds, dict):
+            preds = preds.get("final_head", next(iter(preds.values())))
+        elif isinstance(preds, (list, tuple)):
+            preds = preds[0]
+        return np.asarray(preds).flatten()
 
     explainer = shap.KernelExplainer(predict_fn, background)
     shap_values = explainer.shap_values(explain)
-
     return shap_values, explain, feature_cols
+
+
+def _compute_shap_one_hot(
+    model, df, feature_cols, categorical_cols, n_background, n_explain,
+):
+    """One-hot path: expand listed categoricals, argmax-decode in predict_fn.
+
+    The model still consumes the original string column, so the predict wrapper
+    argmax-decodes the dummy block on each SHAP perturbation before calling
+    the model. Use ``aggregate_categorical_shap`` to collapse the per-dummy
+    SHAP back to one column per original categorical (signed sum across
+    dummies — preserves SHAP additivity).
+    """
+    import shap
+    import pandas as pd
+
+    cat_set = set(categorical_cols)
+    missing = [c for c in categorical_cols if c not in feature_cols]
+    if missing:
+        raise ValueError(f"categorical_cols not in feature_cols: {missing}")
+
+    numerical_cols = [c for c in feature_cols if c not in cat_set]
+
+    # Build one-hot dummy blocks. Vocabulary is fixed by the data passed in
+    # (validation_df), so SHAP's expanded feature names are deterministic.
+    dummy_blocks = {}
+    for cat in categorical_cols:
+        vocab = sorted(df[cat].astype(str).unique())
+        dummy_blocks[cat] = vocab
+
+    expanded_cols = list(numerical_cols) + [
+        f"{cat}__{v}" for cat in categorical_cols for v in dummy_blocks[cat]
+    ]
+
+    df_exp = df[numerical_cols].copy()
+    for cat, vocab in dummy_blocks.items():
+        col_str = df[cat].astype(str)
+        for v in vocab:
+            df_exp[f"{cat}__{v}"] = (col_str == v).astype(float)
+
+    data_array = df_exp.values.astype(np.float64)
+
+    rng = np.random.default_rng(42)
+    n_bg = min(n_background, len(data_array))
+    n_ex = min(n_explain, len(data_array))
+    bg_idx = rng.choice(len(data_array), size=n_bg, replace=False)
+    ex_idx = rng.choice(len(data_array), size=n_ex, replace=False)
+    background = data_array[bg_idx]
+    explain = data_array[ex_idx]
+
+    num_n = len(numerical_cols)
+
+    def predict_fn(X):
+        input_dict = {}
+        # Numerical pass-through
+        for i, col in enumerate(numerical_cols):
+            input_dict[col] = X[:, i].astype(np.float32)
+        # Categorical argmax-decode each dummy block. Coalitions where SHAP
+        # zeroed all dummies (rare) fall back to vocab[0]; coalitions with
+        # multiple "ones" pick the highest value, which is the natural
+        # argmax semantics.
+        ptr = num_n
+        for cat in categorical_cols:
+            vocab = dummy_blocks[cat]
+            k = len(vocab)
+            block = X[:, ptr:ptr + k]
+            idx = np.argmax(block, axis=1)
+            str_vals = np.array([vocab[i] for i in idx])
+            input_dict[cat] = str_vals
+            ptr += k
+
+        ds = tf.data.Dataset.from_tensor_slices(input_dict).batch(256)
+        ds = ds.map(lambda d: {k: tf.expand_dims(v, -1) if tf.rank(v) == 1 else v for k, v in d.items()})
+        preds = model.predict(ds, verbose=0)
+        if isinstance(preds, dict):
+            preds = preds.get("final_head", next(iter(preds.values())))
+        elif isinstance(preds, (list, tuple)):
+            preds = preds[0]
+        return np.asarray(preds).flatten()
+
+    explainer = shap.KernelExplainer(predict_fn, background)
+    shap_values = explainer.shap_values(explain)
+    return shap_values, explain, expanded_cols
+
+
+def aggregate_categorical_shap(
+    shap_values, shap_data, feature_names, categorical_cols,
+):
+    """Collapse one-hot dummy SHAP columns back to one column per categorical.
+
+    The merged SHAP value for row ``r`` is ``sum_k shap_values[r, dummy_k]``
+    -- the signed sum across the dummy block -- which preserves SHAP's
+    additive property: the total contribution of the categorical to row r's
+    prediction is exactly this merged value, and ``|merged|`` is its
+    magnitude (directly comparable to mean ``|SHAP|`` of numerical features).
+
+    For the merged ``shap_data`` matrix, the categorical entry is the argmax
+    index across the dummy block (i.e. which category was "on" for that row).
+    This gives the beeswarm a meaningful per-row color: dots colored by
+    category index instead of a meaningless continuous value.
+
+    Parameters
+    ----------
+    shap_values : ndarray (n_rows, n_expanded)
+    shap_data   : ndarray (n_rows, n_expanded)
+    feature_names : list[str] of length n_expanded, with dummies named
+                    ``{cat}__{value}``.
+    categorical_cols : list[str] of original categorical column names.
+
+    Returns
+    -------
+    merged_shap_values, merged_shap_data, merged_feature_names
+    """
+    import numpy as np
+
+    shap_values = np.asarray(shap_values)
+    shap_data = np.asarray(shap_data)
+
+    cat_to_indices = {c: [] for c in categorical_cols}
+    non_cat_indices = []
+    non_cat_names = []
+    for i, name in enumerate(feature_names):
+        matched_cat = None
+        for cat in categorical_cols:
+            if name.startswith(f"{cat}__"):
+                matched_cat = cat
+                break
+        if matched_cat is not None:
+            cat_to_indices[matched_cat].append(i)
+        else:
+            non_cat_indices.append(i)
+            non_cat_names.append(name)
+
+    for cat in categorical_cols:
+        if not cat_to_indices[cat]:
+            raise ValueError(
+                f"No dummy columns found for categorical '{cat}'. "
+                f"Expected names like '{cat}__<value>' in feature_names."
+            )
+
+    n_rows = shap_values.shape[0]
+    n_merged = len(non_cat_names) + len(categorical_cols)
+    merged_shap_values = np.zeros((n_rows, n_merged))
+    merged_shap_data = np.zeros((n_rows, n_merged))
+    merged_feature_names: list[str] = []
+
+    for j, (i, name) in enumerate(zip(non_cat_indices, non_cat_names)):
+        merged_shap_values[:, j] = shap_values[:, i]
+        merged_shap_data[:, j] = shap_data[:, i]
+        merged_feature_names.append(name)
+
+    base = len(non_cat_names)
+    for j, cat in enumerate(categorical_cols):
+        dummy_idx = cat_to_indices[cat]
+        merged_shap_values[:, base + j] = shap_values[:, dummy_idx].sum(axis=1)
+        merged_shap_data[:, base + j] = np.argmax(shap_data[:, dummy_idx], axis=1)
+        merged_feature_names.append(cat)
+
+    return merged_shap_values, merged_shap_data, merged_feature_names
 
 
 def plot_shap_summary(shap_values, feature_data, feature_names):

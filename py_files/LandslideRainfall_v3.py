@@ -6,6 +6,10 @@ from py_files.GallenModel_v3 import HydraulicConductivityLayerV3
 from py_files.Landslidev2_Old import DiceCrossEntropyLoss
 
 
+# NOTE: this module-level list defines the canonical input order for the
+# physics layers. To train on a reduced feature subset (e.g. via GA-EN
+# feature selection), reassign `py_files.LandslideRainfall_v3.numeric_cols`
+# to the reduced list BEFORE calling `classification_model()`.
 numeric_cols = ['Clay_mean',
   'Sand_mean',
   'Silt_mean',
@@ -28,6 +32,11 @@ numeric_cols = ['Clay_mean',
   'type',
   'soil_texture_idx',
   ]
+
+PHYSICS_REQUIRED_COLS = (
+    "Slope_mean", "BUK_mean", "Prc_mean",
+    "ContributingFactor_mean", "SoilThc_mean",
+)
 
 
 @tf.keras.utils.register_keras_serializable()
@@ -69,6 +78,14 @@ class LandslideRainFallV3():
             Unconstrained coh/ifi + soil-conditioned K for wetness
             Additive-logit hybrid head + auxiliary physics_prob output
         """
+        for required in PHYSICS_REQUIRED_COLS:
+            if required not in numeric_cols:
+                raise ValueError(
+                    f"Physics-required feature '{required}' missing from numeric_cols. "
+                    "Re-point py_files.LandslideRainfall_v3.numeric_cols to a list "
+                    "that includes all PHYSICS_REQUIRED_COLS before building the model."
+                )
+
         units = [32, 64, 8, 64, 32, 8, 32, 8]
         all_features = tf.keras.layers.concatenate(encoded_features)
         features_only = all_features
