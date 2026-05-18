@@ -68,9 +68,13 @@ class LandslideRainFallV3():
        supervision to prevent physics collapse.
     """
 
-    def __init__(self, depth=8, aux_weight=0.3):
+    def __init__(self, depth=8, aux_weight=0.7, residual_scale=2.0):
         self.depth = depth
         self.aux_weight = aux_weight
+        # Caps the residual head in logit space: residual = scale * tanh(dense_out)
+        # so |residual| <= residual_scale. Forces physics to carry most of the signal;
+        # residual can only nudge by up to ~sigmoid(scale) - 0.5 in probability space.
+        self.residual_scale = residual_scale
 
     def classification_model(self, all_inputs, pga_input, soil_idx_input, encoded_features):
         """
@@ -141,7 +145,7 @@ class LandslideRainFallV3():
         ds = DisplacementIntermediate()(ds)
 
         # Physics-only probability (auxiliary output)
-        physics_prob = NewmarkActivation(threshold=2.0, name="physics_prob")(ds, fos, ac, acpg)
+        physics_prob = NewmarkActivation(threshold=5.0, name="physics_prob")(ds, fos, ac, acpg)
 
         # Residual DNN branch (unregularized; allows symmetric corrections)
         res = layers.Dense(
@@ -157,11 +161,18 @@ class LandslideRainFallV3():
             kernel_initializer="random_normal",
             bias_initializer="random_normal",
         )(res)
+        # Bound residual to [-residual_scale, +residual_scale] in logit space.
+        # Prevents the DNN branch from overriding the physics layer (e.g. residual
+        # logits of +10 fully drowning out physics_logit).
+        res_bounded = layers.Activation("tanh", name="residual_tanh")(res)
+        res_scaled = layers.Rescaling(
+            scale=self.residual_scale, name="residual_scaled"
+        )(res_bounded)
 
         # Option A: additive residual in logit space
         # final_logit = logit(physics_prob) + residual
         physics_logit = LogitLayer(name="physics_logit")(physics_prob)
-        combined_logit = layers.Add(name="combined_logit")([physics_logit, res])
+        combined_logit = layers.Add(name="combined_logit")([physics_logit, res_scaled])
         final = layers.Activation("sigmoid", name="final_head")(combined_logit)
 
         # Option B: multi-output for auxiliary supervision on physics_prob
@@ -169,6 +180,41 @@ class LandslideRainFallV3():
             inputs=all_inputs + [pga_input, soil_idx_input],
             outputs={"final_head": final, "physics_prob": physics_prob},
         )
+
+    @staticmethod
+    def build_residual_extractor(model):
+        """Wrap a trained LandslideRainFallV3 model to expose intermediate signals.
+
+        Returns a Keras Model with the same inputs as `model` but named
+        outputs per sample:
+          - residual:      logit-space nudge actually added to physics_logit
+                           (after tanh + scale bounding). This is what matters
+                           for interpreting how the residual moved the prediction.
+          - residual_raw:  unbounded output of residual_dense2 (pre-tanh) — useful
+                           for diagnosing saturation of the bounded residual.
+          - physics_logit: logit(physics_prob), the physics branch in logit space
+          - physics_prob:  physics-only probability
+          - final_head:    final combined probability
+                           (sigmoid(physics_logit + bounded_residual))
+
+        Usage:
+            extractor = LandslideRainFallV3.build_residual_extractor(trained_model)
+            preds = extractor.predict(inference_ds)
+            residual = preds["residual"].squeeze()
+        """
+        outputs = {
+            "residual_raw":  model.get_layer("residual_dense2").output,
+            "physics_logit": model.get_layer("physics_logit").output,
+            "physics_prob":  model.get_layer("physics_prob").output,
+            "final_head":    model.get_layer("final_head").output,
+        }
+        # Newer models (with bounded residual) expose residual_scaled; fall back
+        # to residual_dense2 for backward compatibility with older checkpoints.
+        try:
+            outputs["residual"] = model.get_layer("residual_scaled").output
+        except ValueError:
+            outputs["residual"] = model.get_layer("residual_dense2").output
+        return Model(inputs=model.inputs, outputs=outputs)
 
     @staticmethod
     def to_multi_output_ds(ds, class_weight=None):

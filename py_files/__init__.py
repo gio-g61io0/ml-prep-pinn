@@ -33,5 +33,7 @@ from .feature_selection_ga_en import (
     feature_selection_report,
     plot_ga_frequencies,
     plot_l2_coefficients,
+    plot_repeat_selections,
+    plot_trajectory_heatmap,
     MANDATORY_PHYSICS_COLS_V3,
 )

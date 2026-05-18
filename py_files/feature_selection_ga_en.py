@@ -198,9 +198,16 @@ def _run_single_ga(
     rng: np.random.Generator,
     verbose: bool,
     repeat_idx: int,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run one GA repeat. Returns (final_best_bitstring, trajectory).
+
+    `trajectory` has shape (n_generations, n_features). Row `g` is the
+    best individual of generation g (after fitness-sorting), letting
+    callers compute per-(feature, generation) presence statistics.
+    """
     n_features = len(blocks)
     population = [_random_individual(rng, n_features) for _ in range(pop_size)]
+    trajectory = np.zeros((n_generations, n_features), dtype=np.int8)
 
     for gen in range(n_generations):
         fitnesses = np.array(
@@ -215,6 +222,7 @@ def _run_single_ga(
         order = np.argsort(fitnesses)
         population = [population[i] for i in order]
         fitnesses = fitnesses[order]
+        trajectory[gen] = population[0]
         if verbose:
             best = fitnesses[0]
             print(
@@ -255,7 +263,7 @@ def _run_single_ga(
             for b in population
         ]
     )
-    return population[int(np.argmin(fitnesses))]
+    return population[int(np.argmin(fitnesses))], trajectory
 
 
 # --------------------------------------------------------------------------- #
@@ -433,12 +441,14 @@ def select_features(
 
     # Layer 1: GA repeated n_ga_repeats times
     counts = np.zeros(n_features, dtype=int)
+    repeat_bits: list[np.ndarray] = []
+    trajectories: list[np.ndarray] = []
     for r in range(n_ga_repeats):
         if verbose:
             print(f"--- GA repeat {r + 1}/{n_ga_repeats} ---")
         # Use a fresh RNG seeded per-repeat so runs are reproducible & independent
         repeat_rng = np.random.default_rng(int(rng.integers(0, 2**31 - 1)))
-        best = _run_single_ga(
+        best, trajectory = _run_single_ga(
             X=X, y=y, blocks=blocks,
             pop_size=pop_size, n_generations=n_generations,
             elite_size=elite_size, random_size=random_size,
@@ -448,7 +458,23 @@ def select_features(
             verbose=verbose, repeat_idx=r + 1,
         )
         counts += best.astype(int)
+        repeat_bits.append(best.astype(int).copy())
+        trajectories.append(trajectory)
 
+    feature_names = [blocks[i][0] for i in range(n_features)]
+    repeat_selections = pd.DataFrame(
+        np.stack(repeat_bits, axis=1),
+        index=feature_names,
+        columns=[f"repeat_{r + 1}" for r in range(n_ga_repeats)],
+    )
+    # Per-(feature, repeat) stability score: fraction of generations in which
+    # the feature was in the best individual of that repeat. Shape (F, R).
+    trajectory_stack = np.stack(trajectories, axis=0)  # (R, G, F)
+    trajectory_scores = pd.DataFrame(
+        trajectory_stack.mean(axis=1).T,  # (F, R)
+        index=feature_names,
+        columns=[f"repeat_{r + 1}" for r in range(n_ga_repeats)],
+    )
     frequencies = {blocks[i][0]: float(counts[i] / n_ga_repeats) for i in range(n_features)}
     selected_candidates = [name for name, freq in frequencies.items() if freq >= fsp]
 
@@ -503,6 +529,16 @@ def select_features(
         "numerical": final_numeric,
         "categorical": final_cat,
         "frequencies": frequencies,
+        "repeat_selections": repeat_selections,
+        "trajectory_scores": trajectory_scores,
+        "trajectories": {
+            f"repeat_{r + 1}": pd.DataFrame(
+                trajectories[r],
+                index=[f"gen_{g + 1}" for g in range(n_generations)],
+                columns=feature_names,
+            )
+            for r in range(n_ga_repeats)
+        },
         "ga_survivors": ga_survivors,
         "pruned_by_layer2": pruned_by_layer2,
         "l2_coefficients": l2_coefficients,
@@ -692,6 +728,132 @@ def plot_ga_frequencies(
     ax.invert_yaxis()
     ax.legend(loc="lower right")
     ax.grid(axis="x", linestyle=":", alpha=0.5)
+    return ax
+
+
+def plot_repeat_selections(
+    result: dict,
+    mandatory_cols: list[str] | None = None,
+    sort_by_total: bool = True,
+    annotate_total: bool = True,
+    figsize: tuple = (8, 10),
+    ax=None,
+):
+    """Heatmap of which features were in the best individual of each GA repeat.
+
+    Rows are non-mandatory candidate features; columns are repeats. A filled
+    cell means the feature was in that repeat's final-best bitstring. With
+    `sort_by_total=True`, rows are ordered by total times selected (most
+    consistent at top). With `annotate_total=True`, each row shows its count
+    on the right (e.g., "3/5").
+    """
+    import matplotlib.pyplot as plt
+
+    mandatory_cols = set(mandatory_cols or [])
+    sel = result.get("repeat_selections")
+    if sel is None:
+        raise ValueError(
+            "result is missing 'repeat_selections' — re-run select_features() "
+            "after the latest module update."
+        )
+
+    drop = [c for c in mandatory_cols if c in sel.index]
+    if drop:
+        sel = sel.drop(index=drop)
+    if sel.empty:
+        raise ValueError("No non-mandatory features available to plot.")
+
+    totals = sel.sum(axis=1)
+    if sort_by_total:
+        sel = sel.loc[totals.sort_values(ascending=False, kind="stable").index]
+        totals = totals.loc[sel.index]
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=figsize)
+
+    n_repeats = sel.shape[1]
+    ax.imshow(sel.to_numpy(), aspect="auto", cmap="Greens", vmin=0, vmax=1)
+    ax.set_xticks(range(n_repeats))
+    ax.set_xticklabels(sel.columns, rotation=0)
+    ax.set_yticks(range(sel.shape[0]))
+    ax.set_yticklabels(sel.index)
+    ax.set_xlabel("GA repeat")
+    ax.set_title("Per-repeat selection (filled = in repeat's best individual)")
+
+    # Light cell borders so the grid is readable when many features are 0
+    ax.set_xticks(np.arange(-0.5, n_repeats, 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, sel.shape[0], 1), minor=True)
+    ax.grid(which="minor", color="lightgray", linewidth=0.5)
+    ax.tick_params(which="minor", length=0)
+
+    if annotate_total:
+        for i, total in enumerate(totals):
+            ax.text(
+                n_repeats - 0.4, i, f"  {int(total)}/{n_repeats}",
+                va="center", ha="left", fontsize=8, clip_on=False,
+            )
+
+    return ax
+
+
+def plot_trajectory_heatmap(
+    result: dict,
+    mandatory_cols: list[str] | None = None,
+    sort_by_mean: bool = True,
+    annotate: bool = True,
+    cmap: str = "viridis",
+    figsize: tuple = (8, 10),
+    ax=None,
+):
+    """Heatmap of fraction of generations each feature was in the best individual.
+
+    Rows are non-mandatory candidate features, columns are GA repeats, cell
+    value ∈ [0, 1] = (# generations feature was in repeat's best individual)
+    / n_generations. Continuous shading reveals stability the binary
+    final-winner view (`plot_repeat_selections`) misses — a feature that
+    only entered the best individual in the last generation has score ~0.1
+    even if it ended up in the final winner.
+    """
+    import matplotlib.pyplot as plt
+
+    mandatory_cols = set(mandatory_cols or [])
+    scores = result.get("trajectory_scores")
+    if scores is None:
+        raise ValueError(
+            "result is missing 'trajectory_scores' — re-run select_features() "
+            "after the latest module update."
+        )
+
+    drop = [c for c in mandatory_cols if c in scores.index]
+    if drop:
+        scores = scores.drop(index=drop)
+    if scores.empty:
+        raise ValueError("No non-mandatory features available to plot.")
+
+    if sort_by_mean:
+        means = scores.mean(axis=1)
+        scores = scores.loc[means.sort_values(ascending=False, kind="stable").index]
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=figsize)
+
+    im = ax.imshow(scores.to_numpy(), aspect="auto", cmap=cmap, vmin=0, vmax=1)
+    ax.set_xticks(range(scores.shape[1]))
+    ax.set_xticklabels(scores.columns, rotation=0)
+    ax.set_yticks(range(scores.shape[0]))
+    ax.set_yticklabels(scores.index)
+    ax.set_xlabel("GA repeat")
+    ax.set_title("Generations in best individual (fraction across all generations)")
+    plt.colorbar(im, ax=ax, label="Generations selected / total generations")
+
+    if annotate:
+        for i in range(scores.shape[0]):
+            for j in range(scores.shape[1]):
+                v = float(scores.iat[i, j])
+                color = "white" if v > 0.55 else "black"
+                ax.text(j, i, f"{v:.2f}", ha="center", va="center",
+                        fontsize=7, color=color)
+
     return ax
 
 
