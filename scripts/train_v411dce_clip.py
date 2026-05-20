@@ -28,6 +28,7 @@ from py_files.data import dataframe_to_dataset, NormalizationLayer, CategoricalE
 from py_files.GallenModel_v1 import (
     CohesionLayer,
     InternalFrictionLayer,
+    IFIClipLayer,
     DisplacementLayer,
     NewmarkActivation,
 )
@@ -98,11 +99,7 @@ def build_model(train_ds, numeric_cols, categorical_cols, pga_col):
 
     coh = CohesionLayer()(x)
     ifi = InternalFrictionLayer()(x)
-    ifi = layers.Lambda(
-        lambda t: tf.clip_by_value(t, IFI_CLIP_RAD[0], IFI_CLIP_RAD[1]),
-        output_shape=lambda s: s,
-        name="ifi_clip_0_40",
-    )(ifi)
+    ifi = IFIClipLayer(IFI_CLIP_RAD[0], IFI_CLIP_RAD[1], name="ifi_clip_0_40")(ifi)
 
     ds = DisplacementLayer()([coh, ifi, slope, pga_input, bulk_density])
     ds = layers.LeakyReLU(negative_slope=LEAKY_ALPHA)(ds)

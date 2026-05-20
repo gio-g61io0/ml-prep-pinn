@@ -128,15 +128,23 @@ def train_model_rainfall_v3(
         pga_input, soil_idx_input = None, None
 
         if physics_features is not None:
+            # Categorical / integer-index columns (e.g. soil_texture_idx) must be
+            # excluded from log_transform_skewed AND clip_outliers. log1p on an
+            # integer index silently corrupts one-hot routing inside layers like
+            # HydraulicConductivityLayerV3 (cast(int) on log1p(7)=2.08 → 2),
+            # collapsing all samples into a single bucket and zeroing gradient
+            # for every other bucket.
+            transform_exclude = set(physics_features) | SKIP_NORMALIZATION
+
             train_df, log_cols = log_transform_skewed(
                 train_df,
                 numerical_cols,
                 skew_threshold=skew_threshold,
-                exclude=physics_features,
+                exclude=transform_exclude,
             )
             val_df = apply_log_transform(val_df, log_cols)
 
-            outlier_cols = [c for c in numerical_cols if c not in physics_features]
+            outlier_cols = [c for c in numerical_cols if c not in transform_exclude]
             train_df, thresholds = clip_outliers(
                 train_df,
                 outlier_cols,

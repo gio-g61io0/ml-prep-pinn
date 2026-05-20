@@ -417,6 +417,30 @@ class InternalFrictionLayer(tf.keras.layers.Layer):
 
 
 @tf.keras.utils.register_keras_serializable()
+class IFIClipLayer(tf.keras.layers.Layer):
+    """Hard clip on the internal friction angle (in radians).
+
+    Used as a drop-in replacement for `Lambda(tf.clip_by_value, ...)`, which
+    breaks on reload because the lambda closure doesn't carry `tf` into the
+    deserialization namespace. Bounds are stored on the layer and survive
+    serialization.
+    """
+
+    def __init__(self, low_rad, high_rad, **kwargs):
+        super().__init__(**kwargs)
+        self.low_rad = float(low_rad)
+        self.high_rad = float(high_rad)
+
+    def call(self, inputs):
+        return tf.clip_by_value(inputs, self.low_rad, self.high_rad)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"low_rad": self.low_rad, "high_rad": self.high_rad})
+        return config
+
+
+@tf.keras.utils.register_keras_serializable()
 class LandslideActivationLayer(tf.keras.layers.Layer):
     def __init__(self, **kwargs):
         super(LandslideActivationLayer, self).__init__(**kwargs)
