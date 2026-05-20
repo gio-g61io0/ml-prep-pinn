@@ -275,17 +275,23 @@ class HydraulicConductivityLayer(tf.keras.layers.Layer):
 
 @tf.keras.utils.register_keras_serializable()
 class WetnessLayer(tf.keras.layers.Layer):
-    """Computes empirical wetness m = λ * (R * A) / (T * sin θ), clamped to [0, 1].
+    """Computes empirical wetness m = λ * (R * log1p(A)) / (T * sin θ), clamped to [0, 1].
 
     Input: [precipitation (mm/month), contributing_area (m²), soil_thickness (m), slope (deg), k (m/hr)]
-    Output: m ∈ [0, 1]
+    Output: m ∈ [0, 1]  (now a wetness *index* — see note below)
 
     The learnable scale factor λ ∈ [lambda_min, lambda_max] (default [0.01, 1.0]) lets
-    the model calibrate the formula to avoid saturation at m=1. With raw contributing
-    area in m² (often 1e3-1e4) the unmodified formula tends to produce m >> 1 for most
-    pixels and clips to 1; the scale factor absorbs the unit/scale mismatch.
+    the model calibrate the formula. log1p is applied to contributing_area to compress
+    its wide dynamic range (m² values often span 3 orders of magnitude); without it,
+    high-accumulation pixels saturate at m=1 and block K's gradient through the clip.
+
+    NOTE on physical meaning: with log1p on A, m is no longer dimensionally a
+    saturation ratio — it's a wetness index in the spirit of TOPMODEL's TWI, ranging
+    in [0,1] by construction. The downstream pore-pressure term in
+    DisplacementLayerRainFall still uses m as if it were a saturation ratio; treat
+    that as a hazard-index proxy, not literal Mohr-Coulomb pore pressure.
     """
-    def __init__(self, lambda_min=0.01, lambda_max=1.0, u_lambda_init=-2.0, **kwargs):
+    def __init__(self, lambda_min=0.01, lambda_max=1000.0, u_lambda_init=-2.0, **kwargs):
         kwargs.setdefault("name", "wetness_layer")
         super(WetnessLayer, self).__init__(**kwargs)
         self.lambda_min = lambda_min
@@ -321,8 +327,11 @@ class WetnessLayer(tf.keras.layers.Layer):
         sin_slope = tf.maximum(tf.math.sin(slope_rad), 1e-6)
         # Learnable scale, bounded via sigmoid into [lambda_min, lambda_max]
         scale = self.lambda_min + (self.lambda_max - self.lambda_min) * tf.nn.sigmoid(self.u_lambda)
-        # Wetness ratio
-        m = scale * (r * contributing_area) / (t * sin_slope)
+        # Wetness ratio — log1p compresses the contributing-area dynamic range so the
+        # formula doesn't saturate on high-accumulation pixels (which previously
+        # pegged ~22% of m at 1.0 and blocked K's gradient through clip_by_value).
+        # This makes m a wetness *index* rather than a literal saturation ratio.
+        m = scale * (r * tf.math.log1p(contributing_area)) / (t * sin_slope)
         m = tf.clip_by_value(m, 0.0, 1.0)
         return m
 
@@ -702,7 +711,7 @@ class NewmarkActivation(tf.keras.layers.Layer):
         super(NewmarkActivation, self).__init__(**kwargs)
         self.threshold = threshold
 
-    def call(self, inputs, safety_factor, ac, acpg):
+    def call(self, inputs, safety_factor=None, ac=None, acpg=None):
         return 1.0 / (
             1.0 + tf.exp(self.threshold - inputs)
         )  # The activation function based on the paper
