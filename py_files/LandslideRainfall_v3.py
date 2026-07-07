@@ -68,13 +68,20 @@ class LandslideRainFallV3():
        supervision to prevent physics collapse.
     """
 
-    def __init__(self, depth=8, aux_weight=0.7, residual_scale=3.0):
+    def __init__(self, depth=8, aux_weight=0.7, residual_scale=3.0, use_rainfall=True):
         self.depth = depth
         self.aux_weight = aux_weight
         # Caps the residual head in logit space: residual = scale * tanh(dense_out)
         # so |residual| <= residual_scale. Forces physics to carry most of the signal;
         # residual can only nudge by up to ~sigmoid(scale) - 0.5 in probability space.
         self.residual_scale = residual_scale
+        # When False, builds a "pure earthquake-induced landslide" (EIL) model:
+        # precipitation is fully disconnected from BOTH downstream paths — the
+        # wetness/pore-pressure term (m := 0 -> dry static FoS) AND the residual
+        # DNN branch (which otherwise sees Prc_mean via all_features). Use for
+        # inventories where rainfall does not drive WHERE slides occur (e.g. a
+        # purely seismic trigger). Default True = original rainfall PINN.
+        self.use_rainfall = use_rainfall
 
     def classification_model(self, all_inputs, pga_input, soil_idx_input, encoded_features):
         """
@@ -102,6 +109,12 @@ class LandslideRainFallV3():
         geotech_features = tf.keras.layers.concatenate(
             [f for i, f in enumerate(encoded_features) if i != prc_idx]
         )
+
+        # Pure-EIL: also keep rainfall out of the residual DNN branch (it would
+        # otherwise re-enter via `features_only = all_features`). Fall back to the
+        # Prc-excluded concat so precipitation has NO path to the output.
+        if not self.use_rainfall:
+            features_only = geotech_features
 
         slope = all_inputs[numeric_cols.index("Slope_mean")]
         bulk_unit_weight = all_inputs[numeric_cols.index("BUK_mean")]
@@ -136,7 +149,16 @@ class LandslideRainFallV3():
 
         # Soil-conditioned K for wetness only
         k = HydraulicConductivityLayerV3()(soil_idx_input)
+        # Always build the wetness subgraph so every declared input (precipitation,
+        # contributing area, soil thickness, soil-conductivity index) stays connected
+        # to the output — Keras functional models require it. For pure-EIL we then zero
+        # the wetness index with Rescaling(scale=0): (a) the pore-pressure term in FoS
+        # vanishes (dry static FoS) and (b) the gradient back to precipitation is killed,
+        # so rainfall carries no learnable influence. Rescaling is a serializable built-in
+        # (a Python-lambda Lambda would break load_model's safe deserialization).
         m = WetnessLayer()([precipitation, contributing_area, soil_thickness, slope, k])
+        if not self.use_rainfall:
+            m = layers.Rescaling(scale=0.0, name="m_zero")(m)
         # WetnessLayer already clips m to [0, 1]; pass through a linear "Activation"
         # only to preserve the "m_clip" layer name for downstream diagnostic code.
         # The previous sigmoid here was a bug: sigmoid([0,1]) -> [0.5, 0.731], which
@@ -148,7 +170,7 @@ class LandslideRainFallV3():
         ds = DisplacementIntermediate()(ds)
 
         # Physics-only probability (auxiliary output)
-        physics_prob = NewmarkActivation(threshold=5.0, name="physics_prob")(ds, fos, ac, acpg)
+        physics_prob = NewmarkActivation(threshold=10.0, name="physics_prob")(ds, fos, ac, acpg)
 
         # Residual DNN branch (unregularized; allows symmetric corrections)
         res = layers.Dense(

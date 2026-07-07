@@ -1,0 +1,36 @@
+
+=== Training (56,880 samples) ===
+  fold  1: pre [ 0.42°, 51.57°] mean=34.43°  | post [ 0.42°, 40.00°] mean=33.65°  | clipped >40°: 31.43%  <0°:  0.00%  | bounds OK: True
+  fold  2: pre [14.47°, 57.29°] mean=33.12°  | post [14.47°, 40.00°] mean=32.97°  | clipped >40°:  8.95%  <0°:  0.00%  | bounds OK: True
+  fold  3: pre [ 0.00°, 43.68°] mean=30.92°  | post [ 0.00°, 40.00°] mean=30.87°  | clipped >40°:  4.46%  <0°:  0.00%  | bounds OK: True
+  fold  4: pre [ 0.16°, 55.45°] mean=35.85°  | post [ 0.16°, 40.00°] mean=34.08°  | clipped >40°: 37.72%  <0°:  0.00%  | bounds OK: True
+  fold  5: SKIP (stale Lambda checkpoint — retrain to include)  [ValueError]
+  fold  6: SKIP (stale Lambda checkpoint — retrain to include)  [ValueError]
+  fold  7: SKIP (stale Lambda checkpoint — retrain to include)  [ValueError]
+  fold  8: SKIP (stale Lambda checkpoint — retrain to include)  [ValueError]
+  fold  9: SKIP (stale Lambda checkpoint — retrain to include)  [ValueError]
+  fold 10: SKIP (stale Lambda checkpoint — retrain to include)  [ValueError]
+  → skipped folds: [5, 6, 7, 8, 9, 10]  (retrain via scripts/train_v411dce_clip.py to populate)
+
+=== Validation (241,062 samples) ===
+  fold  1: pre [ 0.00°, 51.82°] mean=31.46°  | post [ 0.00°, 40.00°] mean=31.02°  | clipped >40°: 16.30%  <0°:  0.00%  | bounds OK: True
+  fold  2: pre [ 0.04°, 57.30°] mean=32.76°  | post [ 0.04°, 40.00°] mean=32.63°  | clipped >40°:  7.43%  <0°:  0.00%  | bounds OK: True
+  fold  3: pre [ 0.00°, 45.56°] mean=29.31°  | post [ 0.00°, 40.00°] mean=29.27°  | clipped >40°:  3.10%  <0°:  0.00%  | bounds OK: True
+  fold  4: pre [ 0.00°, 55.45°] mean=34.35°  | post [ 0.00°, 40.00°] mean=33.22°  | clipped >40°: 25.88%  <0°:  0.00%  | bounds OK: True
+  fold  5: SKIP (stale Lambda checkpoint — retrain to include)  [ValueError]
+  fold  6: SKIP (stale Lambda checkpoint — retrain to include)  [ValueError]
+  fold  7: SKIP (stale Lambda checkpoint — retrain to include)  [ValueError]
+  fold  8: SKIP (stale Lambda checkpoint — retrain to include)  [ValueError]
+  fold  9: SKIP (stale Lambda checkpoint — retrain to include)  [ValueError]
+  fold 10: SKIP (stale Lambda checkpoint — retrain to include)  [ValueError]
+  → skipped folds: [5, 6, 7, 8, 9, 10]  (retrain via scripts/train_v411dce_clip.py to populate)
+  wrote /Users/giogonzales/Documents/ml-prep/mlprep/figures/ifi_clip_check/ifi_distribution_training.png
+  wrote /Users/giogonzales/Documents/ml-prep/mlprep/figures/ifi_clip_check/ifi_distribution_validation.png
+  wrote /Users/giogonzales/Documents/ml-prep/mlprep/figures/ifi_clip_check/ifi_post_per_fold_training.png
+  wrote /Users/giogonzales/Documents/ml-prep/mlprep/figures/ifi_clip_check/ifi_post_per_fold_validation.png
+
+=== Aggregate over 10 folds ===
+    Training: mean pre=33.58°  mean post=32.89°  mean clipped(high)=20.64%  mean clipped(low)= 0.00%  all-bounds-ok=True
+  Validation: mean pre=31.97°  mean post=31.53°  mean clipped(high)=13.17%  mean clipped(low)= 0.00%  all-bounds-ok=True
+
+Wrote summary CSV + 4 plots to /Users/giogonzales/Documents/ml-prep/mlprep/figures/ifi_clip_check

@@ -310,6 +310,205 @@ def landslide_density_by_class(y_true, y_pred_probs, gdf=None,
     return result
 
 
+def _default_class_labels(n):
+    """Standard 5-class susceptibility labels, or generic C1..Cn otherwise."""
+    if n == 5:
+        return ["Very Low", "Low", "Moderate", "High", "Very High"]
+    return [f"C{i + 1}" for i in range(n)]
+
+
+def _quantile_area_edges(preds, weight, n_classes):
+    """Area-weighted quantile (equal-area) class edges over predictions in [0, 1].
+
+    Sorts units by susceptibility and places interior edges where the cumulative
+    area share crosses k/n_classes, so each class holds ~1/n_classes of the total
+    area. Returns a strictly increasing edge list anchored at 0.0 and 1.0.
+    Duplicate edges (collapsed by a value gap in a bimodal distribution) are
+    dropped, which may yield fewer than n_classes classes.
+    """
+    order = np.argsort(preds)
+    sorted_preds = preds[order]
+    cum_area = np.cumsum(weight[order]) / weight.sum()
+    interior_q = np.linspace(0.0, 1.0, n_classes + 1)[1:-1]
+    interior_edges = np.interp(interior_q, cum_area, sorted_preds)
+    edges = np.unique(np.concatenate([[0.0], interior_edges, [1.0]]))
+    return [float(e) for e in edges]
+
+
+def frequency_ratio_table(gdf, predictions, label_col="landslide",
+                          model_name=None, bins=None, labels=None,
+                          area_based=True, scheme="fixed", n_classes=5):
+    """Inventory-vs-susceptibility linkage table (reviewer "Table 3", §4.4).
+
+    Spatially overlays the landslide inventory (``label_col`` ground truth) on
+    the model's susceptibility classes and reports, per class:
+
+    - ``pct_area``         : share of study area in this susceptibility class
+    - ``n_landslides``     : number of inventory slope units in this class
+    - ``pct_landslides``   : share of all inventory landslides in this class
+    - ``freq_ratio``       : Frequency Ratio = pct_landslides / pct_area
+                             (>1 = landslides over-represented; a good model
+                             rises monotonically Very Low -> Very High)
+    - ``cum_hit_rate``     : cumulative % of inventory captured, accumulating
+                             from the highest class downward
+
+    Parameters
+    ----------
+    gdf : GeoDataFrame
+        Must contain ``geometry`` (for area) and ``label_col``. Use a projected
+        CRS (e.g. EPSG:3857 / UTM) so areas are metric.
+    predictions : array-like
+        Per-unit predicted susceptibility in [0, 1], aligned to ``gdf`` rows.
+    area_based : bool
+        If True, ``pct_area`` / ``pct_landslides`` are weighted by polygon area
+        (rigorous for variable-size slope units). If False, uses unit counts.
+    scheme : {"fixed", "quantile"}
+        Class edges used when ``bins`` is None. "fixed" = value breakpoints
+        [0, .125, .375, .625, .875, 1]; "quantile" = area-weighted equal-area
+        classes with data-driven edges. See docs/frequency_ratio_classing.md.
+    n_classes : int
+        Number of quantile classes when ``scheme="quantile"`` (default 5).
+
+    Returns
+    -------
+    DataFrame
+        One row per susceptibility class (ordered high -> low so ``cum_hit_rate``
+        reads top-down), with an optional leading ``model`` column.
+    """
+    preds = np.asarray(predictions).flatten()
+    y_true = gdf[label_col].to_numpy()
+    if len(preds) != len(gdf):
+        raise ValueError(
+            f"predictions ({len(preds)}) and gdf ({len(gdf)}) length mismatch"
+        )
+
+    # Per-unit weight: polygon area (metric) or 1 (count-based).
+    if area_based:
+        weight = gdf.geometry.area.to_numpy()
+    else:
+        weight = np.ones(len(gdf))
+
+    # Assign each unit to a susceptibility class. See docs/frequency_ratio_classing.md.
+    #   - explicit `bins` / "fixed" / area-weighted "quantile": value-edge binning.
+    #   - count-based "quantile": RANK-based equal-count classes (robust to ties /
+    #     saturated outputs, where value-edge quantiles collapse).
+    edges = None
+    if bins is not None:
+        edges = list(bins)
+    elif scheme == "fixed":
+        edges = [0, 0.125, 0.375, 0.625, 0.875, 1.0]
+    elif scheme == "quantile" and area_based:
+        edges = _quantile_area_edges(preds, weight, n_classes)
+    elif scheme == "quantile":
+        # rank ties broken by order -> exactly n_classes equal-count bins.
+        ranks = pd.Series(preds).rank(method="first").to_numpy()
+        bin_idx = pd.qcut(ranks, q=n_classes, labels=False).astype(int)
+    else:
+        raise ValueError(f"unknown scheme {scheme!r}; use 'fixed' or 'quantile'")
+
+    if edges is not None:
+        bin_idx = np.clip(np.digitize(preds, edges) - 1, 0, len(edges) - 2)
+
+    n_cls = int(bin_idx.max()) + 1
+    if labels is None:
+        labels = _default_class_labels(n_cls)
+    elif len(labels) != n_cls:
+        print(f"  warning: classing produced {n_cls} populated class(es) but "
+              f"{len(labels)} labels given (likely tie/saturation collapse); relabeling")
+        labels = _default_class_labels(n_cls)
+
+    total_w = weight.sum()
+    total_ls_w = weight[y_true == 1].sum()
+
+    rows = []
+    for i, label in enumerate(labels):
+        mask = bin_idx == i
+        ls_mask = mask & (y_true == 1)
+        class_w = weight[mask].sum()
+        ls_w = weight[ls_mask].sum()
+        pct_area = class_w / total_w if total_w > 0 else 0.0
+        pct_ls = ls_w / total_ls_w if total_ls_w > 0 else 0.0
+        # Observed susceptibility span of the class (honest under tie-split boundaries).
+        lo = float(preds[mask].min()) if mask.any() else float("nan")
+        hi = float(preds[mask].max()) if mask.any() else float("nan")
+        rows.append({
+            "class": label,
+            "sus_range": f"[{lo:.3f}, {hi:.3f}]",
+            "n_slope_units": int(mask.sum()),
+            "area_km2": class_w / 1e6,
+            "pct_area": pct_area,
+            "n_landslides": int((ls_mask).sum()),
+            "pct_landslides": pct_ls,
+            "freq_ratio": pct_ls / pct_area if pct_area > 0 else np.nan,
+        })
+
+    result = pd.DataFrame(rows)
+    # Order high -> low so cumulative hit-rate reads top-down.
+    result = result.iloc[::-1].reset_index(drop=True)
+    result["cum_pct_area"] = result["pct_area"].cumsum()
+    result["cum_hit_rate"] = result["pct_landslides"].cumsum()
+
+    if model_name is not None:
+        result.insert(0, "model", model_name)
+
+    result.attrs["bins"] = list(edges) if edges is not None else None
+    result.attrs["scheme"] = scheme
+
+    edge_desc = ("rank-tertiles" if edges is None
+                 else "[" + ", ".join(f"{b:.4f}" for b in edges) + "]")
+    print(f"[{model_name or 'model'}] scheme={scheme!r}  classes={n_cls}  edges: {edge_desc}")
+    with pd.option_context("display.float_format", lambda v: f"{v:.3f}"):
+        print(result.to_string(index=False))
+    return result
+
+
+def frequency_ratio_summary(model_results, high_label="High"):
+    """Compact multi-model Table 3: one row per model from per-class FR tables.
+
+    Pure reshape of `frequency_ratio_table()` outputs into the manuscript "Table 3"
+    layout (inventory distribution across classes + hit rate and FR for the High
+    class). No new metric logic.
+
+    Parameters
+    ----------
+    model_results : dict[str, DataFrame]
+        Maps model name -> the DataFrame returned by `frequency_ratio_table(...)`.
+        Each frame must contain columns `class`, `pct_landslides`, `pct_area`,
+        `freq_ratio`, `n_slope_units`.
+    high_label : str
+        The class label treated as "High" for the hit-rate / FR columns.
+
+    Returns
+    -------
+    DataFrame
+        One row per model: a `<class> (%)` column per susceptibility class (inventory
+        distribution), plus `hit_rate_high`, `fr_high`, `n_high`, `n_total`.
+        Percentages are 0-100. NaN in `fr_high` flags a collapsed/degenerate High
+        class (e.g. quantile classing on saturated predictions).
+    """
+    rows = []
+    for name, table in model_results.items():
+        if table is None or high_label not in set(table["class"]):
+            rows.append({"model": name, "hit_rate_high": np.nan, "fr_high": np.nan,
+                         "n_high": 0, "n_total": int(table["n_slope_units"].sum())
+                         if table is not None else 0})
+            continue
+        row = {"model": name}
+        for _, r in table.iterrows():
+            row[f"{r['class']} (%)"] = 100.0 * r["pct_landslides"]
+        high = table[table["class"] == high_label].iloc[0]
+        row["hit_rate_high"] = 100.0 * high["pct_landslides"]
+        row["fr_high"] = high["freq_ratio"]
+        row["n_high"] = int(high["n_slope_units"])
+        row["n_total"] = int(table["n_slope_units"].sum())
+        rows.append(row)
+
+    summary = pd.DataFrame(rows)
+    with pd.option_context("display.float_format", lambda v: f"{v:.2f}"):
+        print(summary.to_string(index=False))
+    return summary
+
+
 def plot_intermediate_correlation(intermediates, method="spearman",
                                   title="Intermediate Parameter Correlation"):
     """Correlation heatmap of intermediate physics outputs and selected inputs.
@@ -641,26 +840,65 @@ def plot_predicted_observed_map(gdf, predicted_col, observed_col):
     plt.tight_layout()
     plt.show()
 
-def plot_susceptibility_map(gdf, predictions, label_name, title="PINN Susceptibility Map"):
+def plot_susceptibility_map(
+    gdf,
+    predictions,
+    label_name,
+    title="PINN Susceptibility Map",
+    figsize=(10, 9),
+    dpi=300,
+    zoom="auto",
+    save_path=None,
+):
+    """Plot a slope-unit susceptibility map over a basemap.
+
+    Resolution levers:
+    - ``dpi``: raster resolution of the rendered figure (display + saved file).
+      300 is print quality; bump to 600 for very large maps.
+    - ``zoom``: contextily basemap tile zoom level. ``"auto"`` lets contextily
+      choose; pass an int (e.g. 11-13) for a sharper basemap. Higher = more
+      tiles downloaded = slower.
+    - ``save_path``: if given, writes a high-res file (PNG/PDF/SVG by extension)
+      with the same ``dpi``. Use ``.pdf``/``.svg`` for fully vector output.
+    """
+    gdf = gdf.copy()
     gdf['predicted_susceptibility'] = predictions
     norm = mcolors.Normalize(vmin=0, vmax=1.0)
 
-    fig, ax = plt.subplots(1, 1, figsize=(8, 7))
+    fig, ax = plt.subplots(1, 1, figsize=figsize, dpi=dpi)
 
-    # Remove legend=True here
-    gdf.plot(column='predicted_susceptibility', cmap='plasma_r', ax=ax, norm=norm)
-    # gdf.plot(column=f'Landslide', cmap='plasma_r', ax=ax, norm=norm)
+    # Thin edges keep slope-unit boundaries crisp instead of bleeding together.
+    gdf.plot(
+        column='predicted_susceptibility',
+        cmap='plasma_r',
+        ax=ax,
+        norm=norm,
+        edgecolor='none',
+        antialiased=True,
+    )
 
     # Add single custom colorbar
     sm = plt.cm.ScalarMappable(cmap='plasma_r', norm=norm)
-    # sm._A = []  
     cbar = fig.colorbar(sm, ax=ax)
     cbar.set_ticks([0.0, 0.125, 0.375, 0.625, 0.875, 1.0])
     cbar.set_ticklabels(["0.0", "0.125", "0.375", "0.625", "0.875", "1.0"])
 
     ax.set_title(f"{title} - {label_name}")
-    cx.add_basemap(ax, crs=gdf.crs.to_string(), source=cx.providers.CartoDB.Positron)
+    cx.add_basemap(
+        ax,
+        crs=gdf.crs.to_string(),
+        source=cx.providers.CartoDB.Positron,
+        zoom=zoom,
+    )
     plt.tight_layout()
+
+    if save_path is not None:
+        # LZW keeps TIFF output lossless but far smaller than uncompressed.
+        save_kwargs = {}
+        if str(save_path).lower().endswith(('.tif', '.tiff')):
+            save_kwargs['pil_kwargs'] = {'compression': 'tiff_lzw'}
+        fig.savefig(save_path, dpi=dpi, bbox_inches='tight', **save_kwargs)
+
     plt.show()
 
 def bootstrap_geotech(df, model, columns,filepath, n_bootstrap=50, ):
