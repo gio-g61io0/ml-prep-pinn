@@ -1,0 +1,33 @@
+{
+  "out_dir": "/Users/giogonzales/Documents/ml-prep/mlprep/eda_outputs",
+  "train_rows": 59562,
+  "val_rows": 9988,
+  "final_numeric_features": [
+    "Slope_mean",
+    "BUK_mean",
+    "Prc_mean",
+    "ContributingFactor_mean",
+    "SoilThc_mean",
+    "soil_texture_idx",
+    "PGA2_max",
+    "Elev_mean"
+  ],
+  "final_categorical_features": [
+    "type"
+  ],
+  "top3_drifted": [
+    {
+      "column": "Prc_mean",
+      "ks_stat": 0.7779057611822479
+    },
+    {
+      "column": "ContributingFactor_mean",
+      "ks_stat": 0.5796371010714352
+    },
+    {
+      "column": "BUK_mean",
+      "ks_stat": 0.3311219929783239
+    }
+  ],
+  "top3_correlated": []
+}

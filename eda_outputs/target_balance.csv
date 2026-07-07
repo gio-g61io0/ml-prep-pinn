@@ -1,0 +1,7 @@
+group,level,n,n_positive,positive_rate
+__overall__,all,59562,6615,0.11106074342701723
+type,Loam,166,0,0.0
+type,Sandy Clay Loam,26799,4540,0.1694093063173999
+type,Undifferentiated,32597,2075,0.06365616467773108
+soil_texture_idx,7,51859,6085,0.11733739563045952
+soil_texture_idx,11,7703,530,0.0688043619369077

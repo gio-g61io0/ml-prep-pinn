@@ -10,4 +10,5 @@ geotech_rasters/
 image_outputs/
 docs/
 feature_manifests/
-eda_outputs/
+eda_outputs/*.tif
+figures/*.tif
