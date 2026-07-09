@@ -80,6 +80,87 @@ class HydraulicConductivityLayerV3(tf.keras.layers.Layer):
 
 
 @tf.keras.utils.register_keras_serializable()
+class WetnessRatioLayer(tf.keras.layers.Layer):
+    """Wetness index from a single learnable recharge-to-transmissivity ratio (R/T).
+
+    Implements the TOPMODEL saturation form
+        m = clip( (R/T) * A' / sin θ , 0, 1 )
+    where ``R/T`` is ONE learnable scalar for the whole study area — recharge R
+    (m/hr) over transmissivity T = K·soil_thickness (m²/hr), so R/T has units 1/m.
+    It is estimated DIRECTLY instead of learning K and reading precipitation as R
+    (which is what HydraulicConductivityLayerV3 + WetnessLayer do). This lumps the
+    two most uncertain hydrological quantities — event recharge and transmissivity,
+    each spanning several orders of magnitude — into the single ratio that actually
+    controls wetness, and is the classic TOPMODEL calibration parameter.
+
+    Consequence: precipitation (Prc_mean) no longer enters the wetness formula; the
+    spatial signal comes entirely from contributing area and slope.
+
+    Input:  [contributing_area (m²), slope (deg)]
+    Output: m ∈ [0, 1]
+
+    R/T is bounded log-uniformly into [rt_min, rt_max] via
+        R/T = exp( log(rt_min) + (log(rt_max) - log(rt_min)) * sigmoid(u_rt) ),
+    so one unconstrained weight ``u_rt`` sweeps R/T across its full multi-decade
+    range without a zero-gradient plateau. Default u_rt_init = -2 puts R/T near the
+    low end (avoids starting saturated at m=1).
+
+    NOTE: with ``use_log_area=True`` (default) the contributing area is compressed
+    with log1p — matching WetnessLayer, whose docstring explains that raw A pegs
+    high-accumulation pixels at m=1 and blocks the gradient through the clip. This
+    makes m a wetness *index* (TWI-like), not a literal saturation ratio, and R/T an
+    effective calibration scalar rather than a strict physical ratio. Set
+    ``use_log_area=False`` to use A directly as written in the formula.
+    """
+
+    def __init__(self, rt_min=1e-4, rt_max=1e1, u_rt_init=-2.0, use_log_area=True, **kwargs):
+        kwargs.setdefault("name", "wetness_ratio_layer")
+        super(WetnessRatioLayer, self).__init__(**kwargs)
+        self.rt_min = rt_min
+        self.rt_max = rt_max
+        self.u_rt_init = u_rt_init
+        self.use_log_area = use_log_area
+
+    def build(self, input_shape):
+        # Single learnable scalar; log-uniform sigmoid map keeps R/T in [rt_min, rt_max].
+        self.u_rt = self.add_weight(
+            name="u_rt",
+            shape=(),
+            initializer=tf.keras.initializers.Constant(self.u_rt_init),
+            trainable=True,
+        )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        contributing_area, slope = inputs[0], inputs[1]
+        # Convert slope degrees -> radians; floor sin to avoid divide-by-zero on flats.
+        slope_rad = slope * 0.017453292519943295
+        sin_slope = tf.maximum(tf.math.sin(slope_rad), 1e-6)
+        area = tf.math.log1p(contributing_area) if self.use_log_area else contributing_area
+        # Log-uniform bounding: R/T sweeps [rt_min, rt_max] over the whole real line.
+        log_min = tf.math.log(tf.constant(self.rt_min, dtype=tf.float32))
+        log_max = tf.math.log(tf.constant(self.rt_max, dtype=tf.float32))
+        rt = tf.exp(log_min + (log_max - log_min) * tf.nn.sigmoid(self.u_rt))
+        m = rt * area / sin_slope
+        m = tf.clip_by_value(m, 0.0, 1.0)
+        return m
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "rt_min": self.rt_min,
+            "rt_max": self.rt_max,
+            "u_rt_init": self.u_rt_init,
+            "use_log_area": self.use_log_area,
+        })
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+
+@tf.keras.utils.register_keras_serializable()
 class SoilConditionedGeotechLayerV3(tf.keras.layers.Layer):
     """Per-soil-type learnable baselines for cohesion and internal friction.
 

@@ -190,6 +190,7 @@ def train_model_rainfall_v3(
     imputed_indicator_cols=None,
     imputation_medians=None,
     use_rainfall=True,
+    wetness_mode="conductivity",
 ):
     """
         Trains rainfall PINN model v3 using stratified KFold.
@@ -263,7 +264,7 @@ def train_model_rainfall_v3(
             numerical_cols, categorical_cols, pga_col, train_ds, categorical_encoder,
         )
 
-        model = LandslideRainFallV3(use_rainfall=use_rainfall)
+        model = LandslideRainFallV3(use_rainfall=use_rainfall, wetness_mode=wetness_mode)
         model.classification_model(all_inputs, pga_input, soil_idx_input, encoded_inputs)
         model.get_optimizer()
         model.compile_model_dce()
@@ -340,6 +341,8 @@ def train_production_rainfall_v3(
     val_frac=0.15,
     random_state=42,
     model_filename=PRODUCTION_MODEL_FILENAME,
+    use_rainfall=True,
+    wetness_mode="conductivity",
 ):
     """Train a single production PINN v3 model on the full v2-8 training set.
 
@@ -408,7 +411,7 @@ def train_production_rainfall_v3(
         numerical_cols, categorical_cols, pga_col, train_ds, categorical_encoder,
     )
 
-    model = LandslideRainFallV3()
+    model = LandslideRainFallV3(use_rainfall=use_rainfall, wetness_mode=wetness_mode)
     model.classification_model(all_inputs, pga_input, soil_idx_input, encoded_inputs)
     model.get_optimizer()
     model.compile_model_dce()

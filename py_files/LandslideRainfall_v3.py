@@ -2,7 +2,7 @@ import tensorflow as tf
 from tensorflow.keras import layers, Model, optimizers, metrics, losses
 from py_files.GallenModel import CriticalAcceleration, DisplacementIntermediate, FosLayer
 from py_files.GallenModel_v1 import DisplacementLayerRainFall, NewmarkActivation, WetnessLayer, CohesionLayer, InternalFrictionLayer
-from py_files.GallenModel_v3 import HydraulicConductivityLayerV3
+from py_files.GallenModel_v3 import HydraulicConductivityLayerV3, WetnessRatioLayer
 from py_files.Landslidev2_Old import DiceCrossEntropyLoss
 
 
@@ -68,7 +68,8 @@ class LandslideRainFallV3():
        supervision to prevent physics collapse.
     """
 
-    def __init__(self, depth=8, aux_weight=0.7, residual_scale=3.0, use_rainfall=True):
+    def __init__(self, depth=8, aux_weight=0.7, residual_scale=3.0, use_rainfall=True,
+                 wetness_mode="conductivity"):
         self.depth = depth
         self.aux_weight = aux_weight
         # Caps the residual head in logit space: residual = scale * tanh(dense_out)
@@ -82,6 +83,20 @@ class LandslideRainFallV3():
         # inventories where rainfall does not drive WHERE slides occur (e.g. a
         # purely seismic trigger). Default True = original rainfall PINN.
         self.use_rainfall = use_rainfall
+        # Selects how the wetness index m is produced:
+        #   "conductivity" (default) — learn K per USDA soil texture
+        #       (HydraulicConductivityLayerV3), derive T = K·soil_thickness, and
+        #       read R from Prc_mean inside WetnessLayer. Preserves the trained
+        #       v2-8 architecture and checkpoints.
+        #   "rt_ratio" — estimate the recharge/transmissivity ratio R/T DIRECTLY
+        #       as one learnable scalar (WetnessRatioLayer). Precipitation drops
+        #       out of the wetness formula; wetness varies only with contributing
+        #       area and slope. Classic TOPMODEL lumped calibration parameter.
+        if wetness_mode not in ("conductivity", "rt_ratio"):
+            raise ValueError(
+                f"wetness_mode must be 'conductivity' or 'rt_ratio', got {wetness_mode!r}"
+            )
+        self.wetness_mode = wetness_mode
 
     def classification_model(self, all_inputs, pga_input, soil_idx_input, encoded_features):
         """
@@ -147,16 +162,31 @@ class LandslideRainFallV3():
         coh = CohesionLayer()(x)
         ifi = InternalFrictionLayer()(x)
 
-        # Soil-conditioned K for wetness only
-        k = HydraulicConductivityLayerV3()(soil_idx_input)
-        # Always build the wetness subgraph so every declared input (precipitation,
-        # contributing area, soil thickness, soil-conductivity index) stays connected
-        # to the output — Keras functional models require it. For pure-EIL we then zero
-        # the wetness index with Rescaling(scale=0): (a) the pore-pressure term in FoS
-        # vanishes (dry static FoS) and (b) the gradient back to precipitation is killed,
-        # so rainfall carries no learnable influence. Rescaling is a serializable built-in
-        # (a Python-lambda Lambda would break load_model's safe deserialization).
-        m = WetnessLayer()([precipitation, contributing_area, soil_thickness, slope, k])
+        # --- Wetness index m ---------------------------------------------------
+        # Two interchangeable parameterizations (self.wetness_mode). Both must keep
+        # EVERY declared input connected to an output — Keras functional models
+        # require it — hence the zero-scaled sinks in the rt_ratio branch.
+        if self.wetness_mode == "rt_ratio":
+            # Estimate R/T directly as one learnable scalar. Precipitation and the
+            # soil-conductivity index NO LONGER feed the wetness formula, so tie
+            # them off with Rescaling(scale=0) sinks (no weights, zero gradient) to
+            # keep them in the graph. soil_thickness stays connected via the geotech
+            # MLP / residual branch, so it needs no sink.
+            m = WetnessRatioLayer()([contributing_area, slope])
+            precip_sink = layers.Rescaling(scale=0.0, name="precip_sink")(precipitation)
+            soil_sink = layers.Rescaling(scale=0.0, name="soil_idx_sink")(soil_idx_input)
+            m = layers.Add(name="m_rt_sinks")([m, precip_sink, soil_sink])
+        else:
+            # Default: soil-conditioned K for wetness only.
+            k = HydraulicConductivityLayerV3()(soil_idx_input)
+            # Always build the wetness subgraph so every declared input (precipitation,
+            # contributing area, soil thickness, soil-conductivity index) stays connected
+            # to the output — Keras functional models require it. For pure-EIL we then zero
+            # the wetness index with Rescaling(scale=0): (a) the pore-pressure term in FoS
+            # vanishes (dry static FoS) and (b) the gradient back to precipitation is killed,
+            # so rainfall carries no learnable influence. Rescaling is a serializable built-in
+            # (a Python-lambda Lambda would break load_model's safe deserialization).
+            m = WetnessLayer()([precipitation, contributing_area, soil_thickness, slope, k])
         if not self.use_rainfall:
             m = layers.Rescaling(scale=0.0, name="m_zero")(m)
         # WetnessLayer already clips m to [0, 1]; pass through a linear "Activation"
