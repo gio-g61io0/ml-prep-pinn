@@ -61,7 +61,7 @@ class DisplacementLayerRainFall(tf.keras.layers.Layer):
         )
         slope *= 0.017453292519943295
 
-        pga *= 100
+        pga *= 9.81
         cohesion_t *= 1000.0 #kPa -> Pa
         bulk_density *= 1000.0  # kN/m^3 to N/m^3
         slope_normal_thickness = 3.33  # m

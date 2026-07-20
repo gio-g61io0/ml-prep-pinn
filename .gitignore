@@ -12,3 +12,4 @@ docs/
 feature_manifests/
 eda_outputs/*.tif
 figures/*.tif
+pinn_wave/

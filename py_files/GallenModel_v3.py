@@ -78,79 +78,93 @@ class HydraulicConductivityLayerV3(tf.keras.layers.Layer):
     def from_config(cls, config):
         return cls(**config)
 
+@tf.keras.utils.register_keras_serializable()
+class FOSConsistencyLoss(tf.keras.layers.Layer):
+    def __init__(self, weight=1.0, **kwargs):
+        super().__init__(**kwargs)
+        self.weight = weight
+        self.bce = tf.keras.losses.BinaryCrossentropy()
 
+    def call(self, inputs):
+        final, fos = inputs
+
+        loss = self.bce(final, fos)
+        self.add_loss(self.weight * loss)
+        
+        # track separately
+        self.add_metric(loss, name="fos_loss", aggregation="mean")
+        return final
+    
 @tf.keras.utils.register_keras_serializable()
 class WetnessRatioLayer(tf.keras.layers.Layer):
-    """Wetness index from a single learnable recharge-to-transmissivity ratio (R/T).
+    """Wetness index from a PER-PIXEL recharge-to-transmissivity ratio (R/T).
 
     Implements the TOPMODEL saturation form
         m = clip( (R/T) * A' / sin θ , 0, 1 )
-    where ``R/T`` is ONE learnable scalar for the whole study area — recharge R
-    (m/hr) over transmissivity T = K·soil_thickness (m²/hr), so R/T has units 1/m.
-    It is estimated DIRECTLY instead of learning K and reading precipitation as R
-    (which is what HydraulicConductivityLayerV3 + WetnessLayer do). This lumps the
-    two most uncertain hydrological quantities — event recharge and transmissivity,
-    each spanning several orders of magnitude — into the single ratio that actually
-    controls wetness, and is the classic TOPMODEL calibration parameter.
+    but — unlike the earlier version that used ONE global learnable R/T scalar —
+    both R and T now vary per pixel (the *soil-topographic index* form,
+    ln(a/(T₀·tanβ)), that TOPMODEL uses once transmissivity is not uniform):
 
-    Consequence: precipitation (Prc_mean) no longer enters the wetness formula; the
-    spatial signal comes entirely from contributing area and slope.
+      - ``R`` (recharge, m/hr) is a FREE learned per-pixel field: the caller passes
+        a raw per-pixel logit ``r_raw`` (from a small Dense head), and this layer
+        bounds it log-uniformly into a physical recharge range [r_min, r_max]:
+            R = exp( log(r_min) + (log(r_max) - log(r_min)) * sigmoid(r_raw) ).
+        The bound keeps R free/per-pixel but physically scaled (no runaway values),
+        mirroring the sigmoid-range trick used for K in HydraulicConductivityLayerV3.
+      - ``T`` (transmissivity, m²/hr) is derived per pixel as ``K · soil_thickness``,
+        with K from HydraulicConductivityLayerV3 (learnable per USDA soil texture).
 
-    Input:  [contributing_area (m²), slope (deg)]
+    Motivation: in the Cotabato study area transmissivity varies ~89× across pixels
+    (soil thickness 0–40 m × a ~10× K contrast between soil classes) while recharge
+    varies only ~1.5×, so lumping T into a single scalar is physically indefensible.
+
+    This layer holds NO trainable weights of its own — R comes in pre-computed
+    (bounded here) and T comes from ``k`` and ``soil_thickness``.
+
+    Input:  [r_raw (batch,1), contributing_area (m²), soil_thickness (m),
+             slope (deg), k (m/hr from HydraulicConductivityLayerV3)]
     Output: m ∈ [0, 1]
-
-    R/T is bounded log-uniformly into [rt_min, rt_max] via
-        R/T = exp( log(rt_min) + (log(rt_max) - log(rt_min)) * sigmoid(u_rt) ),
-    so one unconstrained weight ``u_rt`` sweeps R/T across its full multi-decade
-    range without a zero-gradient plateau. Default u_rt_init = -2 puts R/T near the
-    low end (avoids starting saturated at m=1).
 
     NOTE: with ``use_log_area=True`` (default) the contributing area is compressed
     with log1p — matching WetnessLayer, whose docstring explains that raw A pegs
     high-accumulation pixels at m=1 and blocks the gradient through the clip. This
-    makes m a wetness *index* (TWI-like), not a literal saturation ratio, and R/T an
-    effective calibration scalar rather than a strict physical ratio. Set
+    makes m a wetness *index* (TWI-like), not a literal saturation ratio. Set
     ``use_log_area=False`` to use A directly as written in the formula.
     """
 
-    def __init__(self, rt_min=1e-4, rt_max=1e1, u_rt_init=-2.0, use_log_area=True, **kwargs):
+    def __init__(self, r_min=1e-5, r_max=1e-1, use_log_area=True, **kwargs):
         kwargs.setdefault("name", "wetness_ratio_layer")
         super(WetnessRatioLayer, self).__init__(**kwargs)
-        self.rt_min = rt_min
-        self.rt_max = rt_max
-        self.u_rt_init = u_rt_init
+        self.r_min = r_min
+        self.r_max = r_max
         self.use_log_area = use_log_area
 
-    def build(self, input_shape):
-        # Single learnable scalar; log-uniform sigmoid map keeps R/T in [rt_min, rt_max].
-        self.u_rt = self.add_weight(
-            name="u_rt",
-            shape=(),
-            initializer=tf.keras.initializers.Constant(self.u_rt_init),
-            trainable=True,
-        )
-        super().build(input_shape)
-
     def call(self, inputs):
-        contributing_area, slope = inputs[0], inputs[1]
+        r_raw, contributing_area, soil_thickness, slope, k = (
+            inputs[0], inputs[1], inputs[2], inputs[3], inputs[4]
+        )
+        # k arrives as (batch,) from HydraulicConductivityLayerV3; match (batch,1).
+        k = tf.expand_dims(k, -1)
         # Convert slope degrees -> radians; floor sin to avoid divide-by-zero on flats.
         slope_rad = slope * 0.017453292519943295
         sin_slope = tf.maximum(tf.math.sin(slope_rad), 1e-6)
+        # Per-pixel recharge R (m/hr): free logit bounded log-uniformly into
+        # [r_min, r_max] so equal steps in r_raw are equal ratio steps in R.
+        log_min = tf.math.log(tf.constant(self.r_min, dtype=tf.float32))
+        log_max = tf.math.log(tf.constant(self.r_max, dtype=tf.float32))
+        r = tf.exp(log_min + (log_max - log_min) * tf.nn.sigmoid(r_raw))
+        # Per-pixel transmissivity T = K · soil_thickness (m²/hr); floor to avoid /0.
+        t = tf.maximum(k * soil_thickness, 1e-10)
         area = tf.math.log1p(contributing_area) if self.use_log_area else contributing_area
-        # Log-uniform bounding: R/T sweeps [rt_min, rt_max] over the whole real line.
-        log_min = tf.math.log(tf.constant(self.rt_min, dtype=tf.float32))
-        log_max = tf.math.log(tf.constant(self.rt_max, dtype=tf.float32))
-        rt = tf.exp(log_min + (log_max - log_min) * tf.nn.sigmoid(self.u_rt))
-        m = rt * area / sin_slope
+        m = (r / t) * area / sin_slope
         m = tf.clip_by_value(m, 0.0, 1.0)
         return m
 
     def get_config(self):
         config = super().get_config()
         config.update({
-            "rt_min": self.rt_min,
-            "rt_max": self.rt_max,
-            "u_rt_init": self.u_rt_init,
+            "r_min": self.r_min,
+            "r_max": self.r_max,
             "use_log_area": self.use_log_area,
         })
         return config

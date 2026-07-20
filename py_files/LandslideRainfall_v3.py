@@ -2,8 +2,8 @@ import tensorflow as tf
 from tensorflow.keras import layers, Model, optimizers, metrics, losses
 from py_files.GallenModel import CriticalAcceleration, DisplacementIntermediate, FosLayer
 from py_files.GallenModel_v1 import DisplacementLayerRainFall, NewmarkActivation, WetnessLayer, CohesionLayer, InternalFrictionLayer
-from py_files.GallenModel_v3 import HydraulicConductivityLayerV3, WetnessRatioLayer
-from py_files.Landslidev2_Old import DiceCrossEntropyLoss
+from py_files.GallenModel_v3 import FOSConsistencyLoss, HydraulicConductivityLayerV3, WetnessRatioLayer
+from py_files.Landslidev2_Old import DiceCrossEntropyLoss, FOSPhysicsLoss
 
 
 # NOTE: this module-level list defines the canonical input order for the
@@ -167,15 +167,28 @@ class LandslideRainFallV3():
         # EVERY declared input connected to an output — Keras functional models
         # require it — hence the zero-scaled sinks in the rt_ratio branch.
         if self.wetness_mode == "rt_ratio":
-            # Estimate R/T directly as one learnable scalar. Precipitation and the
-            # soil-conductivity index NO LONGER feed the wetness formula, so tie
-            # them off with Rescaling(scale=0) sinks (no weights, zero gradient) to
-            # keep them in the graph. soil_thickness stays connected via the geotech
-            # MLP / residual branch, so it needs no sink.
-            m = WetnessRatioLayer()([contributing_area, slope])
-            precip_sink = layers.Rescaling(scale=0.0, name="precip_sink")(precipitation)
-            soil_sink = layers.Rescaling(scale=0.0, name="soil_idx_sink")(soil_idx_input)
-            m = layers.Add(name="m_rt_sinks")([m, precip_sink, soil_sink])
+            # Per-pixel soil-topographic index. Recharge R is a FREE learned per-pixel
+            # field (small Dense head, bounded to a physical range inside the layer),
+            # and transmissivity T = K(soil)·SoilThc is derived per pixel by reusing
+            # HydraulicConductivityLayerV3. Transmissivity varies ~89× across the area,
+            # so it must NOT be lumped into a single scalar (the old design).
+            k = HydraulicConductivityLayerV3()(soil_idx_input)
+            r_head = layers.Dense(
+                8,
+                name="recharge_head_1",
+                kernel_initializer="random_normal",
+                bias_initializer="random_normal",
+            )(features_only)
+            r_head = layers.LeakyReLU(negative_slope=0.2)(r_head)
+            r_raw = layers.Dense(1, name="recharge_head")(r_head)  # per-pixel recharge logit
+            m = WetnessRatioLayer()([r_raw, contributing_area, soil_thickness, slope, k])
+            # Precip now enters via features_only -> recharge_head; soil_idx via k;
+            # soil_thickness via T. In pure-EIL (use_rainfall=False) features_only
+            # excludes precip, so precipitation would be graph-disconnected — keep it
+            # connected (gradient-dead) with a zero-scale sink only in that case.
+            if not self.use_rainfall:
+                precip_sink = layers.Rescaling(scale=0.0, name="precip_sink")(precipitation)
+                m = layers.Add(name="m_rt_sinks")([m, precip_sink])
         else:
             # Default: soil-conditioned K for wetness only.
             k = HydraulicConductivityLayerV3()(soil_idx_input)
@@ -233,7 +246,7 @@ class LandslideRainFallV3():
         # Option B: multi-output for auxiliary supervision on physics_prob
         self.model = Model(
             inputs=all_inputs + [pga_input, soil_idx_input],
-            outputs={"final_head": final, "physics_prob": physics_prob},
+            outputs={"final_head": final, "physics_prob": physics_prob, "fos":fos},
         )
 
     @staticmethod
@@ -335,3 +348,106 @@ class LandslideRainFallV3():
                 "physics_prob": [metrics.AUC(name="auc")],
             },
         )
+
+
+#Wrapper for the functional model
+class PhysicsModel(tf.keras.Model):
+    def __init__(self, base_model, aux_weight=0.4, fos_weight=0.6, **kwargs):
+        super(PhysicsModel, self).__init__(**kwargs)
+        self.base_model = base_model
+        self.aux_weight = aux_weight
+        self.fos_weight = fos_weight
+        self.dice_loss = DiceCrossEntropyLoss()
+        self.bce_loss = losses.BinaryCrossentropy()
+
+        #Trackers
+        self.loss_tracker = tf.keras.metrics.Mean(name="loss")
+        self.final_loss_tracker = tf.keras.metrics.Mean(name="final_head_loss")
+        self.physics_loss_tracker = tf.keras.metrics.Mean(name="physics_prob_loss")
+        self.fos_loss_tracker = tf.keras.metrics.Mean(name="fos_loss")  
+
+
+
+    def train_step(self, data):
+        x, y, sample_weight = data
+        with tf.GradientTape() as tape:
+            pred = self.base_model(x, training=True)
+            final=pred["final_head"]
+            physics=pred["physics_prob"]
+            fos=pred["fos"]
+
+            final_loss = self.dice_loss(
+                y["final_head"], final, sample_weight=sample_weight['final_head'],
+            )
+            fos_loss = self.bce_loss(final, fos)
+            total_loss = (
+                (final_loss * self.aux_weight) + (self.fos_weight * fos_loss)
+            )
+
+        self.loss_tracker.update_state(total_loss)
+        self.final_loss_tracker.update_state(final_loss)
+        self.fos_loss_tracker.update_state(fos_loss)
+
+        grads = tape.gradient(total_loss, self.base_model.trainable_variables)
+        self.optimizer.apply_gradients(zip(grads, self.base_model.trainable_variables))
+        
+        return {
+            "loss": self.loss_tracker.result(),
+            "final_head_loss": self.final_loss_tracker.result(),
+            "fos_loss": self.fos_loss_tracker.result(),
+        }
+    
+
+    def call(self, inputs, training=False):
+        return self.base_model(inputs, training=training)
+
+    def test_step(self, data):
+        x, y, sample_weight = data
+
+        pred = self.base_model(x, training=False)
+
+        final = pred["final_head"]
+        fos = pred["fos"]
+
+        final_loss = self.dice_loss(
+            y["final_head"],
+            final,
+            sample_weight=sample_weight["final_head"],
+        )
+
+        fos_loss = self.bce_loss(final, fos)
+
+        total_loss = final_loss + self.fos_weight * fos_loss
+
+        self.loss_tracker.update_state(total_loss)
+        self.final_loss_tracker.update_state(final_loss)
+        self.fos_loss_tracker.update_state(fos_loss)
+
+        return {
+            "loss": self.loss_tracker.result(),
+            "final_head_loss": self.final_loss_tracker.result(),
+            "fos_loss": self.fos_loss_tracker.result(),
+        }
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "base_model": self.base_model,
+            "aux_weight": self.aux_weight,
+            "fos_weight": self.fos_weight,
+        })
+        return config
+    
+    
+class BaseModelCheckpoint(tf.keras.callbacks.Callback):
+
+    def __init__(self, filepath):
+        super().__init__()
+        self.filepath = filepath
+
+    def on_epoch_end(self, epoch, logs=None):
+        self.model.base_model.save(self.filepath)
+
+
+class NewmarkPhysicsModel(tf.keras.Model):
+    def __init__(self):
+        pass

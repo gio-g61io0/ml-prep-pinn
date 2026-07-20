@@ -641,3 +641,11 @@ class DiceCrossEntropyLoss(tf.keras.losses.Loss):
         config = super().get_config()
         config.update({"name": self.name})
         return config
+
+@tf.keras.utils.register_keras_serializable()
+class FOSPhysicsLoss(tf.keras.losses.Loss):
+    def __init__(self, name="FosPhysicsLoss"):
+        super().__init__(name=name)
+      
+    def call(self, susceptiblity, p_physics):
+        return tf.reduce_mean(tf.square(susceptiblity - p_physics))
