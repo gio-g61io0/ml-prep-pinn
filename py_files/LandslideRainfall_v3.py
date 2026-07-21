@@ -379,7 +379,12 @@ class PhysicsModel(tf.keras.Model):
             final_loss = self.dice_loss(
                 y["final_head"], final, sample_weight=sample_weight['final_head'],
             )
-            fos_loss = self.bce_loss(final, fos)
+            # FOS teaches final: fos is the (frozen) target, final learns toward it.
+            # reshape both to (batch, 1) so BinaryCrossentropy's strict equal-rank
+            # check can't fail on a shape/rank mismatch between fos and final.
+            fos_t = tf.reshape(fos, [-1, 1])
+            final_t = tf.reshape(final, [-1, 1])
+            fos_loss = self.bce_loss(tf.stop_gradient(fos_t), final_t)
             total_loss = (
                 (final_loss * self.aux_weight) + (self.fos_weight * fos_loss)
             )
@@ -415,7 +420,9 @@ class PhysicsModel(tf.keras.Model):
             sample_weight=sample_weight["final_head"],
         )
 
-        fos_loss = self.bce_loss(final, fos)
+        fos_t = tf.reshape(fos, [-1, 1])
+        final_t = tf.reshape(final, [-1, 1])
+        fos_loss = self.bce_loss(tf.stop_gradient(fos_t), final_t)
 
         total_loss = final_loss + self.fos_weight * fos_loss
 

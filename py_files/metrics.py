@@ -3,6 +3,7 @@ import pandas as pd
 import sklearn
 from matplotlib import pyplot as plt
 import matplotlib.colors as mcolors
+import matplotlib.patheffects as path_effects
 import contextily as cx
 import seaborn as sns
 from .data import dataframe_to_dataset
@@ -840,6 +841,80 @@ def plot_predicted_observed_map(gdf, predicted_col, observed_col):
     plt.tight_layout()
     plt.show()
 
+def _draw_barangay_labels(
+    ax,
+    brgy_boundaries,
+    name_col="ADM4_EN",
+    fontsize=3,
+    min_sep_frac=0.035,
+):
+    """Draw decluttered barangay labels clipped to the current axes extent.
+
+    The raw shapefile labels every barangay at its representative point in the
+    same colour with no collision handling, so they pile into an unreadable
+    mass. This keeps only barangays whose label point falls inside the visible
+    map, then greedily drops any label that would sit within ``min_sep_frac`` of
+    the map diagonal from a label already placed (largest barangays win, since
+    they anchor the most area). A white halo keeps text legible over the map.
+
+    Parameters
+    ----------
+    ax : matplotlib Axes
+        Axes whose current x/y limits define the visible extent.
+    brgy_boundaries : GeoDataFrame
+        Barangay polygons containing ``name_col``. May optionally carry a
+        ``label_point`` geometry column; otherwise interior points are derived.
+    name_col : str
+        Column holding the barangay name to render.
+    fontsize : int
+        Label font size in points.
+    min_sep_frac : float
+        Minimum spacing between placed labels as a fraction of the map diagonal.
+    """
+    if name_col not in brgy_boundaries.columns:
+        raise KeyError(f"barangay name column '{name_col}' not found")
+
+    x_min, x_max = ax.get_xlim()
+    y_min, y_max = ax.get_ylim()
+    diagonal = np.hypot(x_max - x_min, y_max - y_min)
+    min_sep = diagonal * min_sep_frac
+
+    has_label_point = "label_point" in brgy_boundaries.columns
+
+    # Collect (name, point, area) only for barangays visible in the extent.
+    candidates = []
+    for _, row in brgy_boundaries.iterrows():
+        point = row["label_point"] if has_label_point else row.geometry.representative_point()
+        if not (x_min <= point.x <= x_max and y_min <= point.y <= y_max):
+            continue
+        name = row[name_col]
+        if not isinstance(name, str) or not name.strip():
+            continue
+        candidates.append((name, point.x, point.y, row.geometry.area))
+
+    # Largest barangays are placed first so they win ties for scarce label space.
+    candidates.sort(key=lambda c: c[3], reverse=True)
+
+    placed = []
+    for name, px, py, _area in candidates:
+        if any(np.hypot(px - qx, py - qy) < min_sep for qx, qy in placed):
+            continue
+        placed.append((px, py))
+        text = ax.text(
+            px, py, name,
+            fontsize=fontsize,
+            color="black",
+            ha="center",
+            va="center",
+            zorder=5,
+        )
+        text.set_path_effects([
+            path_effects.withStroke(linewidth=1.6, foreground="white"),
+        ])
+
+    return len(placed), len(candidates)
+
+
 def plot_susceptibility_map(
     gdf,
     predictions,
@@ -849,6 +924,8 @@ def plot_susceptibility_map(
     dpi=300,
     zoom="auto",
     save_path=None,
+    brgy_boundaries = None,
+    boundary_label_col="ADM4_EN",
 ):
     """Plot a slope-unit susceptibility map over a basemap.
 
@@ -860,6 +937,12 @@ def plot_susceptibility_map(
       tiles downloaded = slower.
     - ``save_path``: if given, writes a high-res file (PNG/PDF/SVG by extension)
       with the same ``dpi``. Use ``.pdf``/``.svg`` for fully vector output.
+
+    Admin overlay:
+    - ``brgy_boundaries``: optional GeoDataFrame of admin polygons drawn as an
+      overlay with decluttered labels. Pass municipal polygons (dissolved to
+      ADM3) with ``boundary_label_col="ADM3_EN"`` for a coarser, cleaner map.
+    - ``boundary_label_col``: attribute in ``brgy_boundaries`` used for labels.
     """
     gdf = gdf.copy()
     gdf['predicted_susceptibility'] = predictions
@@ -870,7 +953,7 @@ def plot_susceptibility_map(
     # Thin edges keep slope-unit boundaries crisp instead of bleeding together.
     gdf.plot(
         column='predicted_susceptibility',
-        cmap='plasma_r',
+        cmap='RdYlGn_r',
         ax=ax,
         norm=norm,
         edgecolor='none',
@@ -884,6 +967,17 @@ def plot_susceptibility_map(
     cbar.set_ticklabels(["0.0", "0.125", "0.375", "0.625", "0.875", "1.0"])
 
     ax.set_title(f"{title} - {label_name}")
+    if brgy_boundaries is not None:
+        # Draw boundaries first so the axes reach their final extent, then
+        # declutter labels against that extent (interior points, largest-first
+        # greedy spacing, white halo) instead of stamping every barangay.
+        brgy_boundaries.plot(ax=ax, facecolor='none', edgecolor='black', linewidth=0.5)
+        n_placed, n_visible = _draw_barangay_labels(
+            ax, brgy_boundaries, name_col=boundary_label_col,
+        )
+        print(f"  [labels] placed {n_placed}/{n_visible} boundary labels in view")
+
+
     cx.add_basemap(
         ax,
         crs=gdf.crs.to_string(),
