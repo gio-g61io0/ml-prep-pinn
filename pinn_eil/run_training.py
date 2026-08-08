@@ -21,13 +21,14 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pinn_eil as P  # noqa: E402
+from pinn_eil import config as CFG  # noqa: E402
 from pinn_eil import train as T  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 CKPT_DIR = HERE / "checkpoints"
 OUT_DIR = HERE / "outputs"
-CKPT_PATH = CKPT_DIR / "pinn_makilala.keras"
-HIST_PATH = OUT_DIR / "training_history.csv"
+CKPT_PATH = CFG.CHECKPOINT_PATH  # dataset-aware (PINN_EIL_DATASET); default pinn_makilala.keras
+HIST_PATH = OUT_DIR / f"training_history_{CFG.DATA_PREFIX}.csv"
 
 
 def main() -> None:
@@ -40,8 +41,8 @@ def main() -> None:
     sampler = P.UnitSampler(consts.T, seed=0)
     model = P.build_pinn(ranges, consts.T)
 
-    print(f"[setup] units={sampler._n_units} params={model.count_params()} "
-          f"u_scale={consts.u_scale:.4e} T={consts.T}")
+    print(f"[setup] dataset={CFG.DATASET} ({CFG.DATA_PREFIX}) units={sampler._n_units} "
+          f"params={model.count_params()} u_scale={consts.u_scale:.4e} T={consts.T}")
 
     stages = [
         (5.0, int(1200 * scale)),

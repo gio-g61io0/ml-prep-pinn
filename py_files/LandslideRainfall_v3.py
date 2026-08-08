@@ -2,7 +2,11 @@ import tensorflow as tf
 from tensorflow.keras import layers, Model, optimizers, metrics, losses
 from py_files.GallenModel import CriticalAcceleration, DisplacementIntermediate, FosLayer
 from py_files.GallenModel_v1 import DisplacementLayerRainFall, NewmarkActivation, WetnessLayer, CohesionLayer, InternalFrictionLayer
-from py_files.GallenModel_v3 import FOSConsistencyLoss, HydraulicConductivityLayerV3, WetnessRatioLayer
+from py_files.GallenModel_v3 import (
+    FOSConsistencyLoss, HydraulicConductivityLayerV3, WetnessRatioLayer,
+    WetnessLayerDimensional, WetnessLayerFixedRecharge, HydraulicConductivityLayerCms,
+    SoilConditionedGeotechLayerV3,
+)
 from py_files.Landslidev2_Old import DiceCrossEntropyLoss, FOSPhysicsLoss
 
 
@@ -69,7 +73,10 @@ class LandslideRainFallV3():
     """
 
     def __init__(self, depth=8, aux_weight=0.7, residual_scale=3.0, use_rainfall=True,
-                 wetness_mode="conductivity"):
+                 wetness_mode="conductivity", dem_cell_size_m=5.0,
+                 k_table="geotech", k_spread_factor=3.0, trainable_k=True,
+                 geotech_mode="unconstrained", lambda_var=0.01,
+                 recharge=None, recharge_unit=None):
         self.depth = depth
         self.aux_weight = aux_weight
         # Caps the residual head in logit space: residual = scale * tanh(dense_out)
@@ -92,11 +99,81 @@ class LandslideRainFallV3():
         #       as one learnable scalar (WetnessRatioLayer). Precipitation drops
         #       out of the wetness formula; wetness varies only with contributing
         #       area and slope. Classic TOPMODEL lumped calibration parameter.
-        if wetness_mode not in ("conductivity", "rt_ratio"):
+        #   "dimensional" — DIMENSIONALLY CONSISTENT steady-state saturation ratio
+        #       (WetnessLayerDimensional): specific catchment area a = A/b used
+        #       LINEARLY (no log1p), lambda bounded to [0,1] as a dimensionless
+        #       recharge efficiency. m is then a true h_w/H, which is what
+        #       DisplacementLayerRainFall's pore-pressure term actually requires.
+        #       Prefer this for new work; see that layer's docstring for the
+        #       defects in "conductivity" that it fixes. NOT checkpoint-compatible
+        #       with v2-8 weights (different layer, different lambda semantics).
+        #   "fixed_recharge" — same steady-state saturation as "dimensional" but the
+        #       recharge R is a GLOBAL CONSTANT supplied by the caller
+        #       (WetnessLayerFixedRecharge) instead of being read per unit from
+        #       Prc_mean and scaled by a fitted lambda. Use when Prc_mean is a
+        #       precipitation statistic rather than an effective recharge, and when
+        #       the wetness scenario should be an explicit, sweepable modelling
+        #       choice. Requires `recharge` and `recharge_unit`; the wetness path
+        #       then has NO fitted scalar at all.
+        if wetness_mode not in ("conductivity", "rt_ratio", "dimensional", "fixed_recharge"):
             raise ValueError(
-                f"wetness_mode must be 'conductivity' or 'rt_ratio', got {wetness_mode!r}"
+                "wetness_mode must be 'conductivity', 'rt_ratio', 'dimensional' or "
+                f"'fixed_recharge', got {wetness_mode!r}"
             )
         self.wetness_mode = wetness_mode
+        # Contour width b (m) converting total upslope area A (m^2) to specific
+        # catchment area a = A/b (m). MUST equal the cell size of the DEM the
+        # ContributingFactor raster was accumulated on — 5 m for the Cotabato
+        # slope-unit data. Only used by wetness_mode="dimensional".
+        self.dem_cell_size_m = dem_cell_size_m
+        # Ksat source table for HydraulicConductivityLayerCms, in cm/s, converted
+        # x36 to m/hr. "geotech" = geotechnical-textbook bands (the v1 convention);
+        # "rawls" = Rawls et al. 1982. Bounds are rep / and * k_spread_factor, swept
+        # log-uniformly. Only used by wetness_mode="dimensional" — the other two modes
+        # keep HydraulicConductivityLayerV3 so v2-8 checkpoints stay bit-identical.
+        # NOTE: with "geotech", m saturates at 1 for 100% of Cotabato units and lambda
+        # must fall to ~0.007 to recover spatial variation; "rawls" puts lambda at
+        # ~0.089, inside the physical recharge-efficiency band. See
+        # GallenModel_v3.KSAT_REPRESENTATIVE_CM_S.
+        self.k_table = k_table
+        self.k_spread_factor = k_spread_factor
+        # False -> K is FROZEN at the tabulated literature value (spread_factor then
+        # has no effect) instead of being fitted. See HydraulicConductivityLayerCms
+        # on why a fitted K is not separately identifiable from lambda.
+        self.trainable_k = trainable_k
+        # Global effective recharge for wetness_mode="fixed_recharge": a magnitude plus
+        # an explicit unit from GallenModel_v3.RECHARGE_UNIT_TO_M_PER_HR (e.g.
+        # recharge=30, recharge_unit="mm/day"). Both are rejected outside that mode
+        # rather than ignored — a silently discarded recharge would look like the
+        # scenario was applied when it was not.
+        if wetness_mode == "fixed_recharge":
+            if recharge is None or recharge_unit is None:
+                raise ValueError(
+                    "wetness_mode='fixed_recharge' requires both `recharge` and "
+                    "`recharge_unit` (e.g. recharge=30, recharge_unit='mm/day'); "
+                    f"got recharge={recharge!r}, recharge_unit={recharge_unit!r}"
+                )
+        elif recharge is not None or recharge_unit is not None:
+            raise ValueError(
+                "`recharge`/`recharge_unit` only apply to wetness_mode="
+                f"'fixed_recharge', but wetness_mode={wetness_mode!r}"
+            )
+        self.recharge = recharge
+        self.recharge_unit = recharge_unit
+        # Selects how cohesion and internal friction are produced:
+        #   "unconstrained" (default) — CohesionLayer (bare relu) +
+        #       InternalFrictionLayer (bare sigmoid) read off Dense(2). Preserves the
+        #   "soil_conditioned" — SoilConditionedGeotechLayerV3: per-USDA-texture
+       
+       
+        if geotech_mode not in ("unconstrained", "soil_conditioned"):
+            raise ValueError(
+                "geotech_mode must be 'unconstrained' or 'soil_conditioned', "
+                f"got {geotech_mode!r}"
+            )
+        self.geotech_mode = geotech_mode
+        
+        self.lambda_var = lambda_var
 
     def classification_model(self, all_inputs, pga_input, soil_idx_input, encoded_features):
         """
@@ -158,9 +235,21 @@ class LandslideRainFallV3():
         x = layers.Dense(units=2, name="geotechnical_param")(x)
         x = layers.LeakyReLU(negative_slope=0.2)(x)
 
-        # Unconstrained cohesion and internal friction
-        coh = CohesionLayer()(x)
-        ifi = InternalFrictionLayer()(x)
+        if self.geotech_mode == "soil_conditioned":
+            # Per-USDA-texture bounded baselines + bounded residual. The layer reads
+            # x[:, 0] / x[:, 1] as the cohesion / ifi residuals, same slots the
+            # unconstrained layers use, so the Dense head above is unchanged.
+            coh, ifi = SoilConditionedGeotechLayerV3(
+                lambda_var=self.lambda_var,
+                name="soil_geotech_v3",
+            )([soil_idx_input, x])
+            coh =  layers.Activation("linear", name="cohesion_layer")(coh)
+            ifi = layers.Activation("linear", name="internal_friction")(ifi)
+
+        else:
+            # Unconstrained cohesion and internal friction
+            coh = CohesionLayer()(x)
+            ifi = InternalFrictionLayer()(x)
 
         # --- Wetness index m ---------------------------------------------------
         # Two interchangeable parameterizations (self.wetness_mode). Both must keep
@@ -189,6 +278,35 @@ class LandslideRainFallV3():
             if not self.use_rainfall:
                 precip_sink = layers.Rescaling(scale=0.0, name="precip_sink")(precipitation)
                 m = layers.Add(name="m_rt_sinks")([m, precip_sink])
+        elif self.wetness_mode == "dimensional":
+            # Dimensionally closed saturation ratio. Same five inputs as
+            # "conductivity" (so every declared input stays graph-connected) but
+            # a = A/b enters linearly and lambda is a dimensionless [0,1] recharge
+            # efficiency, so m is a genuine h_w/H rather than a fitted index.
+            # Paired with the cm/s conductivity table (x36 to m/hr, log-uniform
+            # bounds) rather than HydraulicConductivityLayerV3's observed-extremes
+            # table, whose arithmetic midpoint is ~2 orders too high.
+            k = HydraulicConductivityLayerCms(
+                k_table=self.k_table, spread_factor=self.k_spread_factor,
+                trainable_k=self.trainable_k,
+            )(soil_idx_input)
+            m = WetnessLayerDimensional(cell_size_m=self.dem_cell_size_m)(
+                [precipitation, contributing_area, soil_thickness, slope, k]
+            )
+        elif self.wetness_mode == "fixed_recharge":
+            # Identical physics and identical five-input signature to "dimensional";
+            # the only difference is that R is the caller's global effective recharge
+            # and there is no fitted lambda. precipitation is passed so the Prc_mean
+            # Input stays graph-connected, and is ignored inside the layer.
+            k = HydraulicConductivityLayerCms(
+                k_table=self.k_table, spread_factor=self.k_spread_factor,
+                trainable_k=self.trainable_k,
+            )(soil_idx_input)
+            m = WetnessLayerFixedRecharge(
+                recharge=self.recharge,
+                recharge_unit=self.recharge_unit,
+                cell_size_m=self.dem_cell_size_m,
+            )([precipitation, contributing_area, soil_thickness, slope, k])
         else:
             # Default: soil-conditioned K for wetness only.
             k = HydraulicConductivityLayerV3()(soil_idx_input)
@@ -202,10 +320,10 @@ class LandslideRainFallV3():
             m = WetnessLayer()([precipitation, contributing_area, soil_thickness, slope, k])
         if not self.use_rainfall:
             m = layers.Rescaling(scale=0.0, name="m_zero")(m)
-        # WetnessLayer already clips m to [0, 1]; pass through a linear "Activation"
-        # only to preserve the "m_clip" layer name for downstream diagnostic code.
-        # The previous sigmoid here was a bug: sigmoid([0,1]) -> [0.5, 0.731], which
-        # compressed physical wetness variation and blocked the gradient to K.
+        # Every wetness layer already clips m to [0, 1]; pass through a linear
+        # "Activation" only to preserve the "m_clip" layer name for downstream
+        # diagnostic code.
+
         m = layers.Activation("linear", name="m_clip")(m)
         ds, fos, critical_acceleration, acpg = DisplacementLayerRainFall()([coh, ifi, slope, pga_input, bulk_unit_weight, m])
         fos = FosLayer()(fos)
@@ -213,7 +331,7 @@ class LandslideRainFallV3():
         ds = DisplacementIntermediate()(ds)
 
         # Physics-only probability (auxiliary output)
-        physics_prob = NewmarkActivation(threshold=10.0, name="physics_prob")(ds, fos, ac, acpg)
+        physics_prob = NewmarkActivation(threshold=2.0, name="physics_prob")(ds, fos, ac, acpg)
 
         # Residual DNN branch (unregularized; allows symmetric corrections)
         res = layers.Dense(
@@ -376,7 +494,7 @@ class PhysicsModel(tf.keras.Model):
             physics=pred["physics_prob"]
             fos=pred["fos"]
 
-            final_loss = self.dice_loss(
+            final_loss = self.bce_loss(
                 y["final_head"], final, sample_weight=sample_weight['final_head'],
             )
             # FOS teaches final: fos is the (frozen) target, final learns toward it.
@@ -414,7 +532,7 @@ class PhysicsModel(tf.keras.Model):
         final = pred["final_head"]
         fos = pred["fos"]
 
-        final_loss = self.dice_loss(
+        final_loss = self.bce_loss(
             y["final_head"],
             final,
             sample_weight=sample_weight["final_head"],

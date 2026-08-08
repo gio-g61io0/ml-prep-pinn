@@ -19,18 +19,51 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
 
-# --- Spec locations ---------------------------------------------------------
-PINN_WAVE_DATA = Path(__file__).resolve().parent.parent / "pinn_wave" / "data"
-DOMAIN_PARAMS_JSON = PINN_WAVE_DATA / "makilala_domain_params.json"
-NORM_SPEC_JSON = PINN_WAVE_DATA / "makilala_norm_spec.json"
-BOUC_WEN_PARQUET = PINN_WAVE_DATA / "makilala_bouc_wen_params.parquet"
-CONDITIONING_PARQUET = PINN_WAVE_DATA / "makilala_pinn_conditioning.parquet"
+# --- Dataset / model selection ----------------------------------------------
+# Two INDEPENDENT axes, so a model trained on one population can be applied to another:
+#   PINN_EIL_DATASET -- which slope-unit population supplies the conditioning/geometry you
+#                       predict ON (and, when training, the units you train on).
+#   PINN_EIL_MODEL   -- which trained checkpoint to load (defaults to DATASET).
+# The intended workflow is "train once on Makilala, then infer on NC":
+#   train : PINN_EIL_DATASET=makilala python -m pinn_eil.run_training 1.0
+#   infer : PINN_EIL_DATASET=nc_cotabato PINN_EIL_MODEL=makilala python -m pinn_eil.predict_map_polygons
+# Recognized names:
+#   "makilala"          -> Makilala only (18,145 units)          [prefix makilala_*]
+#   "nc"/"nc_cotabato"  -> whole North Cotabato (285,644 units)  [prefix nc_cotabato_*]
+# All datasets share the SPECFEM base motion (same 2019 M6.7 Cotabato earthquake), and the
+# model's normalization ranges are baked into its saved .keras -- so inferring on NC data with
+# a Makilala model correctly normalizes NC inputs with Makilala ranges (NC values outside those
+# ranges are extrapolated).
+_DATASET_PREFIX = {"makilala": "makilala", "nc": "nc_cotabato", "nc_cotabato": "nc_cotabato"}
+
+
+def _prefix(name: str) -> str:
+    return _DATASET_PREFIX.get(name.lower(), name.lower())
+
+
+DATASET = os.environ.get("PINN_EIL_DATASET", "makilala").lower()
+DATA_PREFIX = _prefix(DATASET)
+MODEL = os.environ.get("PINN_EIL_MODEL", DATASET).lower()  # defaults to the dataset
+MODEL_PREFIX = _prefix(MODEL)
+
+# --- Spec locations (keyed to the DATA population) --------------------------
+PINN_EIL_DIR = Path(__file__).resolve().parent
+PINN_WAVE_DATA = PINN_EIL_DIR.parent / "pinn_wave" / "data"
+DOMAIN_PARAMS_JSON = PINN_WAVE_DATA / f"{DATA_PREFIX}_domain_params.json"
+NORM_SPEC_JSON = PINN_WAVE_DATA / f"{DATA_PREFIX}_norm_spec.json"
+BOUC_WEN_PARQUET = PINN_WAVE_DATA / f"{DATA_PREFIX}_bouc_wen_params.parquet"
+CONDITIONING_PARQUET = PINN_WAVE_DATA / f"{DATA_PREFIX}_pinn_conditioning.parquet"
+CONDITIONING_GPKG = PINN_WAVE_DATA / f"{DATA_PREFIX}_pinn_conditioning.gpkg"
+
+# Checkpoint is keyed to the MODEL (what you load / where training saves), not the data.
+CHECKPOINT_PATH = PINN_EIL_DIR / "checkpoints" / f"pinn_{MODEL_PREFIX}.keras"
 
 # Synthetic base-motion central frequency [Hz] (FKMODEL site fundamental ~2.1 Hz).
 SEISMIC_F0 = 2.0
@@ -178,19 +211,26 @@ def load_scales(consts: GlobalConsts) -> CharacteristicScales:
     )
 
 
-# --- Per-unit training table ------------------------------------------------
-def load_unit_table() -> pd.DataFrame:
-    """Combine conditioning + Bouc-Wen params into the real Makilala training rows.
+# --- Per-unit conditioning table --------------------------------------------
+def load_unit_table(data_prefix: str | None = None) -> pd.DataFrame:
+    """Combine conditioning + Bouc-Wen params into the per-unit rows for a dataset.
+
+    ``data_prefix`` selects the population (default: the env-selected DATA_PREFIX); pass
+    ``"nc_cotabato"`` explicitly to load the NC table for inference from a process whose
+    env is set to a different (e.g. Makilala) model -- the "train on Makilala, infer on NC"
+    flow. ``config._prefix()`` also resolves aliases like ``"nc"``.
 
     The two parquets are ROW-ALIGNED (same unit order, verified: identical unit_id
-    sequence, matching rho/H_m), but ``unit_id`` is NOT unique (16309 unique of 18145
-    rows) -- so they must be joined POSITIONALLY, never merged on unit_id (which would
-    explode into a many-to-many join).
+    sequence, matching rho/H_m), but ``unit_id`` is NOT unique -- so they are joined
+    POSITIONALLY, never merged on unit_id (which would explode into a many-to-many join).
 
     Returns columns: unit_id, rho, k, eps_y, H, pga, lon, lat (SI units; pga in g).
     """
-    bw = pd.read_parquet(BOUC_WEN_PARQUET)[["k_pa", "eps_y"]].reset_index(drop=True)
-    cond = pd.read_parquet(CONDITIONING_PARQUET)[
+    prefix = DATA_PREFIX if data_prefix is None else _prefix(data_prefix)
+    bw_path = PINN_WAVE_DATA / f"{prefix}_bouc_wen_params.parquet"
+    cond_path = PINN_WAVE_DATA / f"{prefix}_pinn_conditioning.parquet"
+    bw = pd.read_parquet(bw_path)[["k_pa", "eps_y"]].reset_index(drop=True)
+    cond = pd.read_parquet(cond_path)[
         ["unit_id", "rho", "H_m", "pga", "lon", "lat"]].reset_index(drop=True)
     if len(bw) != len(cond):
         raise ValueError(f"Row count mismatch: bouc_wen={len(bw)} conditioning={len(cond)}")

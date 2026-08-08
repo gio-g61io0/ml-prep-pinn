@@ -31,8 +31,9 @@ from pinn_eil.predict_map import peak_surface_displacement, CKPT_PATH  # noqa: E
 
 HERE = Path(__file__).resolve().parent
 OUT_DIR = HERE / "outputs"
-MAP_PNG = OUT_DIR / "makilala_pinn_displacement_map_polygons.png"
-COND_GPKG = CFG.PINN_WAVE_DATA / "makilala_pinn_conditioning.gpkg"
+MAP_PNG = OUT_DIR / f"{CFG.DATA_PREFIX}_pinn_displacement_map_polygons.png"
+OUT_GPKG = OUT_DIR / f"{CFG.DATA_PREFIX}_pinn_displacement.gpkg"
+COND_GPKG = CFG.CONDITIONING_GPKG
 
 
 def main() -> None:
@@ -50,13 +51,19 @@ def main() -> None:
     ):
         raise ValueError("gpkg and unit table are not row-aligned; cannot attach positionally")
 
-    print(f"[predict] {len(table)} slope-unit polygons, z=H surface over [0,{consts.T}s]")
+    print(f"[predict] model={CFG.MODEL_PREFIX} data={CFG.DATA_PREFIX} "
+          f"({len(table)} slope-unit polygons, z=H surface over [0,{consts.T}s])")
+    if CFG.MODEL_PREFIX != CFG.DATA_PREFIX:
+        print(f"[predict] NOTE: applying the {CFG.MODEL_PREFIX} model to {CFG.DATA_PREFIX} data; "
+              "inputs outside the model's training ranges are extrapolated.")
     peaks = peak_surface_displacement(model, consts, table)
-    gdf = gdf.assign(peak_disp_mm=peaks * 1000.0).to_crs(epsg=4326)
+    gdf = gdf.assign(peak_disp_m=peaks, peak_disp_mm=peaks * 1000.0).to_crs(epsg=4326)
     print(f"[predict] peak disp (mm): min={peaks.min()*1000:.1f} "
           f"med={np.median(peaks)*1000:.1f} max={peaks.max()*1000:.1f}")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    gdf.to_file(OUT_GPKG, driver="GPKG")
+    print(f"[saved] {OUT_GPKG}")
     fig, ax = plt.subplots(figsize=(9.5, 8.5))
     gdf.plot(column="peak_disp_mm", cmap="inferno", linewidth=0.0, ax=ax,
              legend=True, legend_kwds={"label": "Peak surface displacement [mm]",
@@ -64,7 +71,7 @@ def main() -> None:
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     ax.set_aspect("equal", adjustable="datalim")
-    ax.set_title("Makilala EIL PINN — predicted peak surface displacement per slope unit\n"
+    ax.set_title(f"EIL PINN [{CFG.DATASET}] — predicted peak surface displacement per slope unit\n"
                  "(2019-12-15 M6.7 Cotabato SPECFEM base motion, scaled per unit by PGA)")
     fig.tight_layout()
     fig.savefig(MAP_PNG, dpi=150)

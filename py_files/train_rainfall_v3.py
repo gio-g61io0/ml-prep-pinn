@@ -5,7 +5,11 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 import numpy as np
 import tensorflow as tf
 from . import LandslideRainfall_v3 as _lr3
-from .LandslideRainfall_v3 import LandslideRainFallV3
+from .LandslideRainfall_v3 import (
+    LandslideRainFallV3,
+    PhysicsModel,
+    BaseModelCheckpoint,
+)
 
 from .data import (
     CategoricalEncoderLayer,
@@ -191,11 +195,28 @@ def train_model_rainfall_v3(
     imputation_medians=None,
     use_rainfall=True,
     wetness_mode="conductivity",
+    dem_cell_size_m=5.0,
+    k_table="geotech",
+    k_spread_factor=3.0,
+    trainable_k=True,
+    geotech_mode="unconstrained",
+    lambda_var=0.01,
+    recharge=None,
+    recharge_unit=None,
+    use_physics_head=True,
 ):
     """
         Trains rainfall PINN model v3 using stratified KFold.
         Unconstrained coh/ifi + HydraulicConductivityLayerV3 for wetness
         with 12 USDA soil texture classes.
+
+        ``use_physics_head`` (default True) trains each fold with the production
+        architecture: the functional model is wrapped in ``PhysicsModel``, which
+        adds the FOS -> final physics loss (aux/fos weights 0.4/0.6) and monitors
+        ``val_loss`` (``PhysicsModel`` does not expose ``val_final_head_auc``).
+        The best-weight base functional model is saved so downstream loaders and
+        ``load_or_regenerate_oof`` stay compatible. Set False to fall back to the
+        plain Dice-CE functional model monitored on ``val_final_head_auc``.
 
         When ``physics_features`` is provided, log-transform and 1/99-percentile
         clipping are derived **inside** each fold from the fold's own training
@@ -264,43 +285,93 @@ def train_model_rainfall_v3(
             numerical_cols, categorical_cols, pga_col, train_ds, categorical_encoder,
         )
 
-        model = LandslideRainFallV3(use_rainfall=use_rainfall, wetness_mode=wetness_mode)
+        model = LandslideRainFallV3(
+        use_rainfall=use_rainfall,
+        wetness_mode=wetness_mode,
+        dem_cell_size_m=dem_cell_size_m,
+        k_table=k_table,
+        k_spread_factor=k_spread_factor,
+        trainable_k=trainable_k,
+        geotech_mode=geotech_mode,
+        lambda_var=lambda_var,
+        recharge=recharge,
+        recharge_unit=recharge_unit,
+    )
         model.classification_model(all_inputs, pga_input, soil_idx_input, encoded_inputs)
         model.get_optimizer()
-        model.compile_model_dce()
 
         # Wrap into dual-head datasets with per-sample weights (multi-output
         # models don't support the class_weight kwarg of fit()).
         train_ds_mo = LandslideRainFallV3.to_multi_output_ds(train_ds, class_weight=class_weight)
-        val_ds_mo = LandslideRainFallV3.to_multi_output_ds(val_ds)
-
-        model_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
-            f"{path}/fold-{fold}-model-v3.keras",
-            monitor="val_final_head_auc",
-            save_best_only=True,
-            save_weights_only=False,
-            mode="max",
-            save_freq="epoch",
-            verbose=0,
+        # PhysicsModel.{train,test}_step unpack a 3-tuple (x, y, sample_weight),
+        # so under the physics head the val set must also carry per-sample
+        # weights (matches cotabato_production_train.ipynb cell 16). The plain
+        # functional path keeps the unweighted 2-tuple val set.
+        val_ds_mo = LandslideRainFallV3.to_multi_output_ds(
+            val_ds, class_weight=class_weight if use_physics_head else None,
         )
 
-        model.model.fit(
-            train_ds_mo,
-            epochs=epochs,
-            batch_size=batch_size,
-            validation_data=val_ds_mo,
-            callbacks=[
-                tf.keras.callbacks.EarlyStopping(
-                    monitor="val_final_head_auc",
-                    mode="max",
-                    patience=5,
-                    restore_best_weights=True,
-                ),
-                model_checkpoint_callback,
-            ],
-        )
-        y_true = val_df['landslide']
-        validation_preds = model.model.predict(val_ds_mo)["final_head"].flatten()
+        fold_path = f"{path}/fold-{fold}-model-v3.keras"
+
+        if use_physics_head:
+            # Production architecture (cotabato_production_train.ipynb cells 14/16):
+            # wrap the functional model in PhysicsModel so training adds the
+            # FOS -> final physics loss. PhysicsModel.test_step exposes only
+            # loss/final_head_loss/fos_loss, so we monitor val_loss (not
+            # val_final_head_auc). The base functional model is saved after fit
+            # (restore_best_weights already left the best weights in place) so the
+            # on-disk checkpoint equals the model that produced the OOF preds and
+            # stays loadable exactly like the old plain-model checkpoints.
+            trainer = PhysicsModel(base_model=model.model)
+            trainer.compile(optimizer=model.optimizer_instance)
+            trainer.fit(
+                train_ds_mo,
+                epochs=epochs,
+                batch_size=batch_size,
+                validation_data=val_ds_mo,
+                callbacks=[
+                    tf.keras.callbacks.EarlyStopping(
+                        monitor="val_loss",
+                        mode="min",
+                        patience=5,
+                        restore_best_weights=True,
+                    ),
+                ],
+            )
+            model.model.save(fold_path)
+            y_true = val_df['landslide']
+            validation_preds = trainer.predict(val_ds_mo)["final_head"].flatten()
+        else:
+            model.compile_model_dce()
+
+            model_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
+                fold_path,
+                monitor="val_final_head_auc",
+                save_best_only=True,
+                save_weights_only=False,
+                mode="max",
+                save_freq="epoch",
+                verbose=0,
+            )
+
+            model.model.fit(
+                train_ds_mo,
+                epochs=epochs,
+                batch_size=batch_size,
+                validation_data=val_ds_mo,
+                callbacks=[
+                    tf.keras.callbacks.EarlyStopping(
+                        monitor="val_final_head_auc",
+                        mode="max",
+                        patience=5,
+                        restore_best_weights=True,
+                    ),
+                    model_checkpoint_callback,
+                ],
+            )
+            y_true = val_df['landslide']
+            validation_preds = model.model.predict(val_ds_mo)["final_head"].flatten()
+
         predictions[val_idx] = validation_preds
 
         fpr, tpr, _ = sklearn.metrics.roc_curve(y_true, validation_preds)
@@ -314,6 +385,28 @@ def train_model_rainfall_v3(
         plt.plot(fpr, tpr, lw=1, alpha=0.3, label=f"Fold {fold} (AUC={auc:.2f}, Acc={acc})")
 
         fold += 1
+
+    # Mean ROC across folds. The headline "mean AUC" is the AUC of the averaged
+    # interpolated ROC curve — sklearn.metrics.auc(mean_fpr, mean_tpr) — matching
+    # train.py::train_model_folds_no_pga. This is NOT the arithmetic mean of the
+    # per-fold AUC scalars (reported separately below as mean ± std).
+    plt.plot([0, 1], [0, 1], linestyle="--", lw=1, color="grey", alpha=0.6, label="Chance")
+    mean_tpr = np.mean(tprs, axis=0)
+    mean_tpr[-1] = 1.0
+    mean_auc = sklearn.metrics.auc(mean_fpr, mean_tpr)
+    std_auc = np.std(aucs)
+    print(f"\nPer-fold AUCs:        {[round(a, 4) for a in aucs]}")
+    print(f"Mean ROC AUC (curve): {mean_auc:.4f}")
+    print(f"Per-fold mean ± std:  {np.mean(aucs):.4f} ± {std_auc:.4f}")
+    plt.plot(
+        mean_fpr, mean_tpr, color="blue", lw=2,
+        label=f"Mean ROC (AUC = {mean_auc:.3f} ± {std_auc:.3f})",
+    )
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("Per-fold ROC — 5-fold CV")
+    plt.legend(loc="lower right")
+    plt.show()
 
     np.save(os.path.join(path, OOF_FILENAME), predictions)
 
@@ -343,6 +436,14 @@ def train_production_rainfall_v3(
     model_filename=PRODUCTION_MODEL_FILENAME,
     use_rainfall=True,
     wetness_mode="conductivity",
+    dem_cell_size_m=5.0,
+    k_table="geotech",
+    k_spread_factor=3.0,
+    trainable_k=True,
+    geotech_mode="unconstrained",
+    lambda_var=0.01,
+    recharge=None,
+    recharge_unit=None,
 ):
     """Train a single production PINN v3 model on the full v2-8 training set.
 
@@ -411,7 +512,18 @@ def train_production_rainfall_v3(
         numerical_cols, categorical_cols, pga_col, train_ds, categorical_encoder,
     )
 
-    model = LandslideRainFallV3(use_rainfall=use_rainfall, wetness_mode=wetness_mode)
+    model = LandslideRainFallV3(
+        use_rainfall=use_rainfall,
+        wetness_mode=wetness_mode,
+        dem_cell_size_m=dem_cell_size_m,
+        k_table=k_table,
+        k_spread_factor=k_spread_factor,
+        trainable_k=trainable_k,
+        geotech_mode=geotech_mode,
+        lambda_var=lambda_var,
+        recharge=recharge,
+        recharge_unit=recharge_unit,
+    )
     model.classification_model(all_inputs, pga_input, soil_idx_input, encoded_inputs)
     model.get_optimizer()
     model.compile_model_dce()

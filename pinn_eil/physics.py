@@ -9,17 +9,23 @@ carried in ``batch`` and globals (alpha, A, beta, gamma, n, g, T, u_scale) in ``
 
   strain    eps   = du/dz
   stress    sigma = alpha*k*eps + (1-alpha)*k*eps_y*Phi
-  momentum  r_pde = rho*u_tt - sigma_z - rho*g,
+  momentum  r_pde = rho*u_tt - sigma_z - rho*g + rho*a_base(t, pga),
                     sigma_z = alpha*k*u_zz + (1-alpha)*k*eps_y*Phi_z   (k, eps_y const in z)
   Bouc-Wen  r_bw  = Phi_t - (1/eps_y)*[A*eps_dot - beta*|eps_dot|*|Phi|^(n-1)*Phi
                                        - gamma*eps_dot*|Phi|^n],  eps_dot = d(u_z)/dt
-  BC base   (z=0): u(0,t) = u_input(t, pga)     [synthetic Ricker x PGA -> seismic.py]
+  BC base   (z=0): u(0,t) = 0                   [FIXED base -- excitation is the body force]
   BC surf   (z=H): sigma(H,t) = 0
   IC        (t=0): u=0, u_t=0, Phi=0
 
+FORMULATION (body-force / relative-displacement). ``u`` is displacement RELATIVE to the base;
+total = u + u_base(t). The earthquake enters as the inertial body force +rho*a_base(t) in the
+momentum residual (a_base = real_base_acceleration, the SPECFEM acceleration record scaled per
+unit by PGA), NOT as a prescribed base displacement -- so the base BC is fixed (u(0,t)=0).
+This avoids double-counting the excitation. Static gravity (-rho*g) is retained.
+
 The tape watches PHYSICAL z, t; the model normalizes internally, so autodiff returns
-physical derivatives directly. Conditioning coeffs (rho, k, eps_y, H, pga) are treated
-as constants at each point (not differentiated).
+physical derivatives directly. Conditioning coeffs (rho, k, eps_y, H, pga) and the source
+term a_base(t) are treated as constants at each point (not differentiated).
 """
 from __future__ import annotations
 
@@ -28,7 +34,7 @@ from typing import Callable
 import tensorflow as tf
 
 from .config import GlobalConsts
-from .seismic import real_base_motion
+from .seismic import real_base_acceleration, zero_base_motion
 
 _EPS = 1e-8  # guard for |Phi|^(n-1) near Phi=0
 
@@ -47,7 +53,8 @@ def _coeffs(batch: dict) -> dict[str, tf.Tensor]:
 
 def _model_input(z: tf.Tensor, t: tf.Tensor, c: dict) -> tf.Tensor:
     """Assemble the physical input vector [z, t, rho, k, eps_y, H, pga]."""
-    return tf.concat([z, t, c["rho"], c["k"], c["eps_y"], c["H"], c["pga"]], axis=1)
+    concat = tf.concat([z, t, c["rho"], c["k"], c["eps_y"], c["H"], c["pga"]], axis=1)
+    return concat
 
 
 def _forward(model, consts: GlobalConsts, z, t, c):
@@ -61,8 +68,19 @@ def mse(residual: tf.Tensor) -> tf.Tensor:
 
 
 # --- Interior residuals -----------------------------------------------------
-def pde_residual(model, consts: GlobalConsts, batch: dict) -> tf.Tensor:
-    """Momentum residual r_pde = rho*u_tt - sigma_z - rho*g."""
+def pde_residual(
+    model,
+    consts: GlobalConsts,
+    batch: dict,
+    a_input: Callable = real_base_acceleration,
+) -> tf.Tensor:
+    """Momentum residual r_pde = rho*u_tt - sigma_z - rho*g + rho*a_base(t, pga).
+
+    Body-force formulation: the earthquake enters as the inertial source +rho*a_base(t)
+    (a_input, default the SPECFEM acceleration record scaled per unit by PGA), so ``u`` is
+    displacement relative to the base. Pass ``a_input=zero_base_motion`` to recover the pure
+    source-free operator (used by the manufactured-solution correctness test).
+    """
     c = _coeffs(batch)
     z, t = _col(batch["z"]), _col(batch["t"])
     with tf.GradientTape(persistent=True) as tape2:
@@ -82,7 +100,8 @@ def pde_residual(model, consts: GlobalConsts, batch: dict) -> tf.Tensor:
 
     sigma_z = consts.alpha * c["k"] * u_zz \
         + (1.0 - consts.alpha) * c["k"] * c["eps_y"] * phi_z
-    return c["rho"] * u_tt - sigma_z - c["rho"] * consts.g
+    a_base = a_input(t, c["pga"])   # inertial forcing (source term; not differentiated)
+    return c["rho"] * u_tt - sigma_z - c["rho"] * consts.g + c["rho"] * a_base
 
 
 def boucwen_residual(model, consts: GlobalConsts, batch: dict) -> tf.Tensor:
@@ -116,18 +135,19 @@ def bc_residual(
     model,
     consts: GlobalConsts,
     batch: dict,
-    u_input: Callable = real_base_motion,
+    u_input: Callable = zero_base_motion,
 ) -> dict[str, tf.Tensor]:
     """Boundary residuals along t.
 
-    base (z=0):    u(0, t) - u_input(t, pga)   [default: real 2019 M6.7 base motion]
+    base (z=0):    u(0, t) - u_input(t, pga)   [default: zero -> FIXED base, since the
+                   excitation is the body force in pde_residual; ``u`` is relative displacement]
     surface (z=H): sigma(H, t) = alpha*k*u_z + (1-alpha)*k*eps_y*Phi
     """
     c = _coeffs(batch)
     t = _col(batch["t"])
     n = tf.shape(t)[0]
 
-    # base: prescribed displacement (synthetic Ricker x PGA)
+    # base: fixed (u(0,t) = 0); the earthquake drives the column via the body force instead
     z_base = tf.zeros((n, 1), dtype=tf.float32)
     u_base, _ = _forward(model, consts, z_base, t, c)
     r_base = u_base - u_input(t, c["pga"])

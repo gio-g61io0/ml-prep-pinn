@@ -171,7 +171,8 @@ def main() -> None:
             failures.append(f"deriv:{key}={err:.1e}")
 
     col_b = _const_batch(None, N, coeffs, z=z_np, t=t_np)
-    r_pde = physics.pde_residual(fake, ct, col_b).numpy()
+    # a_input=zero -> pure source-free operator, so the analytic form omits the body force
+    r_pde = physics.pde_residual(fake, ct, col_b, a_input=P.zero_base_motion).numpy()
     r_bw = physics.boucwen_residual(fake, ct, col_b).numpy()
     an_pde = _an_r_pde(f, ct.alpha, coeffs["k"], coeffs["eps_y"], coeffs["rho"], ct.g)
     an_bw = _an_r_bw(f, ct.A, ct.beta, ct.gamma, ct.n, coeffs["eps_y"])
@@ -181,7 +182,17 @@ def main() -> None:
         if err >= RTOL:
             failures.append(f"residual:{name}={err:.1e}")
 
-    # BC (base uses zero base motion so residual == analytic u(0,t)); surface stress.
+    # body-force wiring: r_pde(default a_input) - r_pde(zero) must equal rho*a_base(t, pga)
+    r_pde_forced = physics.pde_residual(fake, ct, col_b).numpy()  # default real_base_acceleration
+    a_base = P.real_base_acceleration(t_np, col_b["pga"]).numpy()
+    delta_an = coeffs["rho"] * a_base
+    err_bf = _rel_l2(r_pde_forced - r_pde, delta_an)
+    print(f"    body_force   relL2={err_bf:.2e} {'OK' if err_bf < RTOL else 'FAIL'} "
+          f"(peak rho*a_base={np.max(np.abs(delta_an)):.3e} Pa/m)")
+    if err_bf >= RTOL:
+        failures.append(f"body_force={err_bf:.1e}")
+
+    # BC (base is FIXED: u_input=zero, so base residual == analytic u(0,t)); surface stress.
     Nb = 200
     t_bc = rng.uniform(0.0, consts.T, (Nb, 1))
     bc_b = _const_batch(None, Nb, coeffs, t=t_bc)
@@ -210,7 +221,7 @@ def main() -> None:
     # --- 3. Linear-elastic reduction --------------------------------------- #
     print("\n[3] Linear-elastic reduction (alpha=1)")
     ct_lin = replace(ct, alpha=1.0)
-    r_lin = physics.pde_residual(fake, ct_lin, col_b).numpy()
+    r_lin = physics.pde_residual(fake, ct_lin, col_b, a_input=P.zero_base_motion).numpy()
     an_lin = coeffs["rho"] * f["u_tt"] - coeffs["k"] * f["u_zz"] - coeffs["rho"] * ct_lin.g
     err_lin = _rel_l2(r_lin, an_lin)
     c = math.sqrt(coeffs["k"] / coeffs["rho"])

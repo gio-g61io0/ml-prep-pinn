@@ -4,6 +4,11 @@ For every Makilala slope unit, query the trained network at the surface (z = H) 
 time grid, take the peak |u| (the displacement-hazard metric), and plot it at the unit's
 (lon, lat).
 
+NOTE (body-force formulation): the network outputs displacement RELATIVE to the base, so this
+peak is the surface-vs-base (site-response) displacement -- the shear-relevant hazard metric.
+Total surface motion would be u_rel(H, t) + u_base(t); the relative peak is what matters for
+slope failure.
+
 Run:  cd mlprep && venv/bin/python -m pinn_eil.predict_map
 
 Outputs:
@@ -26,19 +31,20 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pinn_eil as P  # noqa: E402  (registers custom layers for model loading)
+from pinn_eil import config as CFG  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-CKPT_PATH = HERE / "checkpoints" / "pinn_makilala.keras"
+CKPT_PATH = CFG.CHECKPOINT_PATH  # dataset-aware (PINN_EIL_DATASET); default pinn_makilala.keras
 OUT_DIR = HERE / "outputs"
-PRED_CSV = OUT_DIR / "makilala_pinn_predictions.csv"
-MAP_PNG = OUT_DIR / "makilala_pinn_displacement_map.png"
+PRED_CSV = OUT_DIR / f"{CFG.DATA_PREFIX}_pinn_predictions.csv"
+MAP_PNG = OUT_DIR / f"{CFG.DATA_PREFIX}_pinn_displacement_map.png"
 
 N_T = 240          # time samples per unit for the peak
 UNIT_CHUNK = 512   # units per evaluation batch
 
 
 def peak_surface_displacement(model, consts, table: pd.DataFrame) -> np.ndarray:
-    """Peak |u(z=H, t)| over [0, T] for each unit (physical metres)."""
+    """Peak |u_rel(z=H, t)| over [0, T] for each unit (physical metres, relative to base)."""
     t_grid = np.linspace(0.0, consts.T, N_T, dtype=np.float32)
     n = len(table)
     peaks = np.empty(n, dtype=np.float32)

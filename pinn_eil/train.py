@@ -127,19 +127,22 @@ def train_curriculum(
     sampler,
     stages: list[tuple[float, int]] | None = None,
     weights: LossWeights | None = None,
+    optimizer: tf.keras.optimizers.Optimizer | None = None,
     **kwargs,
 ) -> list[dict]:
     """Time-window curriculum: train on growing time windows, sharing optimizer state.
 
     Args:
-        stages: list of (t_max, epochs). Default expands 5 -> 10 -> 20 -> full T.
+        stages:    list of (t_max, epochs). Default expands 5 -> 10 -> 20 -> full T.
+        optimizer: optimizer shared across all stages; if None, a fresh Adam +
+                   ExponentialDecay is created (via make_optimizer).
     Returns the concatenated history across all stages.
     """
     if stages is None:
         T = consts.T
         stages = [(min(5.0, T), 1000), (min(10.0, T), 1000),
                   (min(20.0, T), 1000), (T, 1500)]
-    optimizer = make_optimizer()
+    optimizer = optimizer or make_optimizer()
     history: list[dict] = []
     offset = 0
     for i, (t_max, epochs) in enumerate(stages):

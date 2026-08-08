@@ -187,7 +187,7 @@ class LoggingRandomSearch(RandomSearch):
     
 @tf.keras.utils.register_keras_serializable()
 class FosLayer(tf.keras.layers.Layer):
-    def __init__(self, threshold=1.50, sharpness=5.0, **kwargs):
+    def __init__(self, threshold=1.25, sharpness=5.0, **kwargs):
         kwargs.setdefault("name", "fos_layer")  # default name if not provided
         super(FosLayer, self).__init__(**kwargs)
         self.threshold = threshold
