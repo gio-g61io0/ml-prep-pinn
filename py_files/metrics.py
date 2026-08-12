@@ -961,7 +961,7 @@ def plot_susceptibility_map(
     )
 
     # Add single custom colorbar
-    sm = plt.cm.ScalarMappable(cmap='plasma_r', norm=norm)
+    sm = plt.cm.ScalarMappable(cmap='RdYlGn_r', norm=norm)
     cbar = fig.colorbar(sm, ax=ax)
     cbar.set_ticks([0.0, 0.125, 0.375, 0.625, 0.875, 1.0])
     cbar.set_ticklabels(["0.0", "0.125", "0.375", "0.625", "0.875", "1.0"])

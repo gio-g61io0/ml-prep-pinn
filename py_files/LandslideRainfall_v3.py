@@ -5,7 +5,7 @@ from py_files.GallenModel_v1 import DisplacementLayerRainFall, NewmarkActivation
 from py_files.GallenModel_v3 import (
     FOSConsistencyLoss, HydraulicConductivityLayerV3, WetnessRatioLayer,
     WetnessLayerDimensional, WetnessLayerFixedRecharge, HydraulicConductivityLayerCms,
-    SoilConditionedGeotechLayerV3,
+    SoilConditionedGeotechLayerV3, DisplacementLayerRainFallV3,
 )
 from py_files.Landslidev2_Old import DiceCrossEntropyLoss, FOSPhysicsLoss
 
@@ -76,7 +76,8 @@ class LandslideRainFallV3():
                  wetness_mode="conductivity", dem_cell_size_m=5.0,
                  k_table="geotech", k_spread_factor=3.0, trainable_k=True,
                  geotech_mode="unconstrained", lambda_var=0.01,
-                 recharge=None, recharge_unit=None):
+                 recharge=None, recharge_unit=None,
+                 fos_thickness="fixed"):
         self.depth = depth
         self.aux_weight = aux_weight
         # Caps the residual head in logit space: residual = scale * tanh(dense_out)
@@ -121,6 +122,22 @@ class LandslideRainFallV3():
                 f"'fixed_recharge', got {wetness_mode!r}"
             )
         self.wetness_mode = wetness_mode
+        # Which thickness the FOS cohesion term uses, c/(gamma*H*sin theta):
+        #   "fixed"          — the v1 hardcoded 3.33 m slab. Keeps every existing
+        #       checkpoint reproducible, but disagrees with the thickness the wetness
+        #       layer uses for T = K*H, so m = h_w/H is the saturated fraction of one
+        #       column applied to the pore-pressure term of a different one.
+        #   "soil_thickness" — SoilThc_mean per unit, the SAME H the wetness layer
+        #       sees (DisplacementLayerRainFallV3). This is the self-consistent
+        #       infinite-slope/SHALSTAB formulation: failure surface at the
+        #       soil-bedrock interface, m = h_w/H the saturated fraction of the
+        #       failing slab. Lowers FOS (H > 3.33 m shrinks the cohesion term);
+        #       on Cotabato median FOS 2.77 -> 1.20 and %FOS<1 goes 0.4% -> 35.1%.
+        if fos_thickness not in ("fixed", "soil_thickness"):
+            raise ValueError(
+                f"fos_thickness must be 'fixed' or 'soil_thickness', got {fos_thickness!r}"
+            )
+        self.fos_thickness = fos_thickness
         # Contour width b (m) converting total upslope area A (m^2) to specific
         # catchment area a = A/b (m). MUST equal the cell size of the DEM the
         # ContributingFactor raster was accumulated on — 5 m for the Cotabato
@@ -325,13 +342,21 @@ class LandslideRainFallV3():
         # diagnostic code.
 
         m = layers.Activation("linear", name="m_clip")(m)
-        ds, fos, critical_acceleration, acpg = DisplacementLayerRainFall()([coh, ifi, slope, pga_input, bulk_unit_weight, m])
+        if self.fos_thickness == "soil_thickness":
+            # Same H the wetness layer used for T = K*H, so m = h_w/H and the
+            # pore-pressure term refer to the same soil column. See the layer
+            # docstring and the `fos_thickness` note in __init__.
+            ds, fos, critical_acceleration, acpg = DisplacementLayerRainFallV3()(
+                [coh, ifi, slope, pga_input, bulk_unit_weight, m, soil_thickness]
+            )
+        else:
+            ds, fos, critical_acceleration, acpg = DisplacementLayerRainFall()([coh, ifi, slope, pga_input, bulk_unit_weight, m])
         fos = FosLayer()(fos)
         ac, acpg = CriticalAcceleration()(critical_acceleration, acpg)
         ds = DisplacementIntermediate()(ds)
 
         # Physics-only probability (auxiliary output)
-        physics_prob = NewmarkActivation(threshold=10.0, name="physics_prob")(ds, fos, ac, acpg)
+        physics_prob = NewmarkActivation(threshold=5.0, name="physics_prob")(ds, fos, ac, acpg)
 
         # Residual DNN branch (unregularized; allows symmetric corrections)
         res = layers.Dense(

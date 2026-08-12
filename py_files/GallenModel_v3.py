@@ -430,7 +430,7 @@ def steady_state_saturation(r, contributing_area, soil_thickness, slope,
     m = scale * (r * a) / (t * sin_slope)
     # m > 1 is physically "saturated to the surface", so clipping is the model,
     # not a rescaling trick.
-    return tf.clip_by_value(m, 0.0, 1.0)
+    return tf.sigmoid(m)
 
 
 @tf.keras.utils.register_keras_serializable()
@@ -844,6 +844,100 @@ class SoilConditionedGeotechLayerV3(tf.keras.layers.Layer):
             "residual_scale_coh": self.residual_scale_coh,
             "residual_scale_ifi": self.residual_scale_ifi,
         })
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+
+@tf.keras.utils.register_keras_serializable()
+class DisplacementLayerRainFallV3(tf.keras.layers.Layer):
+    """Newmark displacement with the failure-slab thickness read PER UNIT.
+
+    Identical physics to ``GallenModel_v1.DisplacementLayerRainFall`` except that the
+    slab thickness H is an INPUT (``SoilThc_mean``) instead of the hardcoded 3.33 m.
+
+    WHY THIS EXISTS. The v1 layer fixes the failure slab at 3.33 m while the wetness
+    layers derive transmissivity T = K*H from ``SoilThc_mean`` (median 14.22 m in
+    Cotabato). Two different thicknesses for the same soil column in one forward pass:
+    ``m = h_w/H`` is then the saturated fraction of a 14.22 m column but gets applied
+    to the pore-pressure term of a 3.33 m slab. In the standard infinite-slope /
+    SHALSTAB formulation these are the SAME H -- the failure surface is the
+    soil-bedrock interface at depth H, and m = h_w/H is directly the saturated
+    fraction of the failing slab, which is what makes it valid to drop m straight
+    into the pore-pressure term.
+
+    Only the COHESION term carries H:
+
+        FOS = c/(gamma*H*sin theta) + (tan phi / tan theta) * (1 - m*gamma_w/gamma)
+               ^^^ H here             ^^^ no H: it cancels in the pore-pressure ratio
+
+    so switching 3.33 m -> SoilThc_mean divides the cohesion term by H/3.33 (4.27x at
+    the Cotabato median) and LOWERS FOS. Measured on the 285,635 Cotabato units with
+    literature-range coh/phi: median FOS 2.77 -> 1.20, and the fraction with FOS < 1
+    goes 0.4% -> 35.1%. That is the intended effect -- under the v1 layer nothing
+    failed statically anywhere.
+
+    Input:  [cohesion (kPa), friction_angle (rad), slope (deg), pga (g),
+             bulk_unit_weight (kN/m^3), m (dimensionless), soil_thickness (m)]
+            Same first six tensors as the v1 layer, with H appended.
+    Output: (displacement_cm, safety_factor, critical_acceleration, ac_over_pga)
+
+    ``min_thickness_m`` floors H so units with SoilThc_mean = 0 give a thin slab
+    (large cohesion term) rather than a division by zero. It defaults to 0.5 m to
+    match ``WetnessLayerDimensional`` / ``WetnessLayerFixedRecharge``, so both layers
+    see the SAME thickness for the same unit -- which is the whole point of this layer.
+    """
+
+    def __init__(self, min_thickness_m=0.5, **kwargs):
+        kwargs.setdefault("name", "displacement_rainfall_v3")
+        super(DisplacementLayerRainFallV3, self).__init__(**kwargs)
+        self.min_thickness_m = min_thickness_m
+
+    def call(self, inputs):
+        cohesion_t, friction_angle, slope, pga, bulk_density, m, soil_thickness = (
+            inputs[0], inputs[1], inputs[2], inputs[3],
+            inputs[4], inputs[5], inputs[6],
+        )
+        slope = slope * 0.017453292519943295
+        pga = pga * 9.81
+        cohesion_t = cohesion_t * 1000.0            # kPa -> Pa
+        bulk_density = bulk_density * 1000.0        # kN/m^3 -> N/m^3
+
+        # The one substantive change from v1: H per unit, not the 3.33 m constant.
+        thickness = tf.maximum(soil_thickness, self.min_thickness_m)
+
+        cohesion_t = tf.expand_dims(cohesion_t, 1)
+        friction_angle = tf.expand_dims(friction_angle, 1)
+        m = tf.reshape(m, [-1])
+        m = tf.expand_dims(m, 1)
+
+        water_unit_weight = 9810.0  # N/m^3
+
+        safety_factor = (
+            cohesion_t / ((bulk_density * thickness) * tf.math.sin(slope))
+            + (tf.math.tan(friction_angle) / tf.math.tan(slope))
+            - ((m * water_unit_weight * tf.math.tan(friction_angle))
+               / (bulk_density * tf.math.tan(slope)))
+        )
+
+        ac = (safety_factor - 1) * 9.81 * tf.math.sin(slope)
+        ac = layers.ReLU()(ac)
+
+        acpg = ac / pga
+        # Same bounds as v1: 0.05 caps displacement at ~135 cm, 0.75 lets stable
+        # slopes reach ~0.12 cm. See DisplacementLayerRainFall for the derivation.
+        acpg = tf.clip_by_value(acpg, 0.05, 0.75)
+
+        powcomp = tf.math.pow((1 - acpg), 2.341) * tf.math.pow(acpg, -1.438)
+        logds = 0.215 + tf.math.log(powcomp) + 0.51
+
+        return tf.math.exp(logds), safety_factor, ac, acpg
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"min_thickness_m": self.min_thickness_m})
         return config
 
     @classmethod

@@ -203,6 +203,7 @@ def train_model_rainfall_v3(
     lambda_var=0.01,
     recharge=None,
     recharge_unit=None,
+    fos_thickness="fixed",
     use_physics_head=True,
 ):
     """
@@ -296,6 +297,7 @@ def train_model_rainfall_v3(
         lambda_var=lambda_var,
         recharge=recharge,
         recharge_unit=recharge_unit,
+        fos_thickness=fos_thickness,
     )
         model.classification_model(all_inputs, pga_input, soil_idx_input, encoded_inputs)
         model.get_optimizer()
@@ -444,6 +446,7 @@ def train_production_rainfall_v3(
     lambda_var=0.01,
     recharge=None,
     recharge_unit=None,
+    fos_thickness="fixed",
 ):
     """Train a single production PINN v3 model on the full v2-8 training set.
 
@@ -523,6 +526,7 @@ def train_production_rainfall_v3(
         lambda_var=lambda_var,
         recharge=recharge,
         recharge_unit=recharge_unit,
+        fos_thickness=fos_thickness,
     )
     model.classification_model(all_inputs, pga_input, soil_idx_input, encoded_inputs)
     model.get_optimizer()
