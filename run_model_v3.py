@@ -404,17 +404,76 @@ def report_pga_choice(df, source_col, slot, explicit):
               "(pass --pga-col to switch).")
 
 
-def build_model_inputs(df, model, pga_col=None):
+def coerce_to_input_dtype(values, dtype):
+    """Return ``values`` in the dtype the model input declares.
+
+    Categorical inputs are `dtype="string"` (a StringLookup was adapted on the
+    training column), but another dataset can carry the same variable as class
+    codes — Cianjur's ``Soil Type`` is int32 3/6 — and Keras refuses to cast
+    int32 to string ("Cast int32 to string is not supported"). Integral codes
+    are stringified without a ``.0`` tail so they read as ``"3"``, matching how
+    `scripts/predict_cianjur_v2_8.py` feeds the same field.
+    """
+    series = pd.Series(np.asarray(values))
+    if dtype != "string":
+        return pd.to_numeric(series, errors="coerce").astype("float32")
+    if pd.api.types.is_numeric_dtype(series):
+        is_integral = series.dropna().mod(1).eq(0).all()
+        if is_integral:
+            return series.astype("Int64").astype(str)
+    return series.astype(str)
+
+
+def report_categorical_coverage(feed_df, model):
+    """Print how much of each string input the model's vocabulary recognizes.
+
+    Coercing an int-coded column to string makes the model *run*; it does not
+    make the values mean anything. Codes like ``"3"`` are absent from a
+    vocabulary of texture names, so every unit collapses onto the single OOV
+    embedding and the categorical feature carries no signal. That is a silent
+    quality failure, so it is reported rather than assumed away.
+    """
+    lookups = [l for l in model.layers if isinstance(l, tf.keras.layers.StringLookup)]
+    if not lookups:
+        return
+    vocab = {str(v) for l in lookups for v in l.get_vocabulary()}
+
+    for tensor in model.inputs:
+        if tensor.dtype != "string" or tensor.name not in feed_df.columns:
+            continue
+        values = feed_df[tensor.name].astype(str)
+        known = values.isin(vocab).mean()
+        print(f"  Categorical '{tensor.name}': {known:.1%} of values in the model "
+              f"vocabulary {sorted(vocab)}")
+        if known == 0:
+            print(f"  [{tensor.name}] NO value matches the training vocabulary — every "
+                  "unit gets the same out-of-vocabulary embedding, so this feature is "
+                  f"inert. Sample values: {sorted(values.unique())[:5]}. "
+                  "Pass --type-col to point it at a comparable column.")
+
+
+def build_model_inputs(df, model, pga_col=None, type_col=None):
     """Select exactly the columns this model declares as inputs.
 
     ``pga_col`` copies a dataset PGA column into the model's PGA input slot,
     overriding any same-named column. Left unset, the model's own input name is
     used as-is — which is not always right across datasets, hence
-    ``report_pga_choice``.
+    ``report_pga_choice``. ``type_col`` does the same for the categorical
+    ``type`` slot, whose codes differ across study areas.
     """
     # Keras 3 dropped Functional.input_names; the keras tensors carry them.
     required = [t.name for t in model.inputs]
+    dtypes = {t.name: t.dtype for t in model.inputs}
     resolved, missing = match_columns(df, required)
+
+    if type_col:
+        if type_col not in df.columns:
+            raise KeyError(f"--type-col '{type_col}' not in the data. Columns: {sorted(df.columns)}")
+        string_slots = [name for name in required if dtypes[name] == "string"]
+        if len(string_slots) != 1:
+            raise ValueError(f"Expected exactly one string model input to alias, got {string_slots}")
+        resolved[string_slots[0]] = type_col
+        missing = [c for c in missing if c != string_slots[0]]
 
     pga_slots = [c for c in required if "PGA" in c.upper()]
     if pga_col:
@@ -435,15 +494,43 @@ def build_model_inputs(df, model, pga_col=None):
     for slot in pga_slots:
         report_pga_choice(df, resolved[slot], slot, explicit=bool(pga_col))
 
-    out = pd.DataFrame({name: df[resolved[name]].values for name in required}, index=df.index)
+    out = pd.DataFrame(
+        {
+            name: coerce_to_input_dtype(df[resolved[name]].values, dtypes[name]).values
+            for name in required
+        },
+        index=df.index,
+    )
+    report_categorical_coverage(out, model)
     # dataframe_to_dataset pops `landslide` as the label. Predictions ignore it,
     # but the key has to exist — so unlabeled inference data gets a dummy column.
     out[LABEL_COL] = df[LABEL_COL].values if LABEL_COL in df.columns else 0
     return out
 
 
+def describe(label, values):
+    """Print nan-safe stats for a physics layer, naming any non-finite rows.
+
+    A plain ``values.mean()`` returns nan when *any* element is nan, so a handful
+    of bad input rows (33 of 28,806 units with ``BUK_mean == 0`` divide by zero in
+    the FOS) reads identically to a wholly broken model. Reporting the count
+    separates "a few rows have bad data" from "nothing works".
+    """
+    finite = np.isfinite(values)
+    n_bad = int((~finite).sum())
+    if not finite.any():
+        print(f"  {label:20s} — ALL {len(values)} values non-finite")
+        return
+    good = values[finite]
+    line = f"  {label:20s} — mean: {good.mean():.4f}, std: {good.std():.4f}"
+    if n_bad:
+        line += (f"  [{n_bad} of {len(values)} rows non-finite — check the physics "
+                 "inputs for zeros/nodata, e.g. BUK_mean or SoilThc_mean]")
+    print(line)
+
+
 def run(data_path: str, model_path: str, output_dir: str = None, pixel_size: float = 30.0,
-        figure_dir: str = None, pga_col: str = None):
+        figure_dir: str = None, pga_col: str = None, type_col: str = None):
     print(f"Loading data from {data_path}")
     df, feature_cols, df_full = load_and_preprocess(data_path)
 
@@ -455,31 +542,31 @@ def run(data_path: str, model_path: str, output_dir: str = None, pixel_size: flo
     model = load_trained_model(model_path)
     model.summary()
 
-    feed_df = build_model_inputs(df, model, pga_col=pga_col)
+    feed_df = build_model_inputs(df, model, pga_col=pga_col, type_col=type_col)
     ds = dataframe_to_dataset(feed_df, shuffle=False, batch_size=BATCH_SIZE)
 
     susceptibility = predict_susceptibility(model, ds)
 
     fos = extract_intermediate(model, ds, "fos").flatten()
-    print(f"  Factor of Safety     — mean: {fos.mean():.4f}, std: {fos.std():.4f}")
+    describe("Factor of Safety", fos)
 
     ac_outputs = extract_intermediate(model, ds, "critical_acceleration")
     ac = ac_outputs[0].flatten()
     acpg = ac_outputs[1].flatten()
-    print(f"  Critical Accel (ac)  — mean: {ac.mean():.4f}, std: {ac.std():.4f}")
-    print(f"  ac / PGA (acpg)      — mean: {acpg.mean():.4f}, std: {acpg.std():.4f}")
+    describe("Critical Accel (ac)", ac)
+    describe("ac / PGA (acpg)", acpg)
 
     displacement = extract_intermediate(model, ds, "displacement").flatten()
-    print(f"  Displacement (cm)    — mean: {displacement.mean():.4f}, std: {displacement.std():.4f}")
+    describe("Displacement (cm)", displacement)
 
     cohesion = extract_intermediate(model, ds, "cohesion").flatten()
-    print(f"  Cohesion (kPa)       — mean: {cohesion.mean():.4f}, std: {cohesion.std():.4f}")
+    describe("Cohesion (kPa)", cohesion)
 
     ifi = extract_intermediate(model, ds, "internal_friction").flatten()
-    print(f"  Int. Friction (rad)  — mean: {ifi.mean():.4f}, std: {ifi.std():.4f}")
+    describe("Int. Friction (rad)", ifi)
 
     wetness = extract_intermediate(model, ds, "wetness").flatten()
-    print(f"  Wetness (m)          — mean: {wetness.mean():.4f}, std: {wetness.std():.4f}")
+    describe("Wetness (m)", wetness)
 
     k_layer_name, k_m_hr = learned_conductivity(model)
     print(f"\n  Learned Ksat per USDA soil texture (from '{k_layer_name}'):")
@@ -562,6 +649,15 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--type-col", default=None,
+        help=(
+            "Data column to feed into the model's categorical 'type' input. Useful when "
+            "the dataset stores it as class codes the model's vocabulary never saw "
+            "(e.g. --type-col soil_texture to use the USDA texture derived from "
+            "clay/silt/sand instead)."
+        ),
+    )
+    parser.add_argument(
         "--figure-dir", default=None,
         help=(
             "Directory for PNG figures (maps, boxplots, histogram, learned-K chart). "
@@ -581,4 +677,5 @@ if __name__ == "__main__":
         pixel_size=args.pixel_size,
         figure_dir=figure_dir,
         pga_col=args.pga_col,
+        type_col=args.type_col,
     )
