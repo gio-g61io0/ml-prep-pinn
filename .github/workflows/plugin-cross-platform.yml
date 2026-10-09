@@ -1,0 +1,181 @@
+# Cross-platform CI for the MLPREP QGIS plugin.
+#
+# This exists to cover the two things a single Apple Silicon Mac cannot:
+#   * running the Windows code paths on actual Windows
+#   * building the depositional-routing engine for Intel macOS
+#
+# Everything else (macOS arm64, Linux x64) is verified locally by
+# build_binaries.sh / build_native.sh.
+name: plugin cross-platform
+
+on:
+  push:
+    paths: ["MLPREP_Plugin_v4/**", ".github/workflows/plugin-cross-platform.yml"]
+  pull_request:
+    paths: ["MLPREP_Plugin_v4/**", ".github/workflows/plugin-cross-platform.yml"]
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: MLPREP_Plugin_v4
+
+jobs:
+  # The Windows code paths — QuoteArg/BuildCmdLine, EXE_SUFFIX, Scripts vs bin,
+  # CREATE_NO_WINDOW — are dead code on macOS. This is the only place they run.
+  tests:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.25", cache-dependency-path: MLPREP_Plugin_v4/ml-prep-scripts/go.sum }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: Go vet
+        run: go vet ./...
+        working-directory: MLPREP_Plugin_v4/ml-prep-scripts
+
+      - name: Go tests
+        run: go test ./... -v
+        working-directory: MLPREP_Plugin_v4/ml-prep-scripts
+
+      - name: Python tests
+        run: |
+          python -m pip install --quiet pytest
+          python -m pytest tests/ -v
+
+  # Proves the cross-compiled engine is a runnable program on each target, not
+  # just something that linked.
+  engines:
+    name: zonal engine smoke test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.25", cache-dependency-path: MLPREP_Plugin_v4/ml-prep-scripts/go.sum }
+
+      - name: Build for this host
+        run: go build -o zonal_probe ./
+        working-directory: MLPREP_Plugin_v4/ml-prep-scripts
+
+      - name: Run it
+        shell: bash
+        run: |
+          cd ml-prep-scripts
+          # No -dem/-slopeUnit: the engine must exit with its own usage error,
+          # which proves it started rather than failing to load.
+          output="$(./zonal_probe 2>&1 || true)"
+          echo "$output"
+          echo "$output" | grep -q "Must provide either -dem or -slopeUnit"
+
+  # The Intel macOS build of the C++/MPI engine. macos-13 is the last
+  # Intel-based GitHub runner image.
+  native-macos-intel:
+    name: routing engine (darwin_amd64)
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GDAL and Open MPI
+        run: brew install gdal open-mpi
+
+      - name: Build and bundle
+        run: ./build_native.sh host
+
+      - name: Verify it is self-contained
+        run: |
+          bin=bin/darwin_amd64/step4_deposition_zone_mpi
+          file "$bin"
+          otool -L "$bin"
+          # Any remaining absolute non-system path means the bundle is incomplete
+          # and the binary will fail on a machine without matching Homebrew.
+          if otool -L "$bin" | tail -n +2 | grep -vE "@rpath|/usr/lib/|/System/"; then
+            echo "::error::binary still links to absolute paths"
+            exit 1
+          fi
+          "$bin" --help || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: routing-engine-darwin_amd64
+          path: MLPREP_Plugin_v4/bin/darwin_amd64/
+          retention-days: 30
+
+  # Actually executes install_grass_windows.bat on Windows. This cannot be done
+  # locally: Docker on macOS runs a Linux daemon, and Windows containers need a
+  # Windows kernel, so a Windows runner is the only way to run batch at all.
+  grass-installer:
+    name: GRASS installer script (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # /check touches nothing and skips the ~940 MB download, so it runs on
+      # every push. It proves cmd.exe parses the file and that the detection
+      # subroutines execute.
+      - name: Parse and run detection (no install)
+        shell: cmd
+        run: scripts\install_grass_windows.bat /check
+
+      - name: Usage banner
+        shell: cmd
+        run: scripts\install_grass_windows.bat /? 
+
+      - name: File must be CRLF
+        shell: pwsh
+        run: |
+          $bytes = [IO.File]::ReadAllBytes("scripts/install_grass_windows.bat")
+          $lf = ($bytes | Where-Object { $_ -eq 10 }).Count
+          $crlf = 0
+          for ($i = 1; $i -lt $bytes.Length; $i++) {
+            if ($bytes[$i] -eq 10 -and $bytes[$i-1] -eq 13) { $crlf++ }
+          }
+          Write-Host "CRLF $crlf of $lf lines"
+          if ($crlf -ne $lf) { Write-Error "batch file is not CRLF"; exit 1 }
+
+  # Opt-in: the real thing, including the ~940 MB download and the addon.
+  # Run it from the Actions tab when the installer itself needs verifying.
+  grass-installer-full:
+    name: GRASS installer script - full install (windows, manual)
+    runs-on: windows-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GRASS and the r.slopeunits addon
+        shell: cmd
+        timeout-minutes: 45
+        run: scripts\install_grass_windows.bat
+
+      - name: Confirm the plugin's own resolver finds it
+        shell: pwsh
+        run: |
+          python -m pip install --quiet pytest
+          python -c "import platform_utils as pu; p = pu.find_exe('grass','grass'); print('resolved:', p); exit(0 if p else 1)"
+
+  # The Windows engine ships without bundled DLLs, so it depends on the host
+  # supplying GDAL and MS-MPI. This reports what it actually needs.
+  windows-engine-deps:
+    name: routing engine deps (windows_amd64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Inspect the prebuilt engine's imports
+        shell: pwsh
+        run: |
+          $exe = "bin/windows_amd64/step4_deposition_zone_mpi.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Host "::notice::no prebuilt Windows engine committed (bin/ is gitignored)"
+            exit 0
+          }
+          dumpbin /dependents $exe

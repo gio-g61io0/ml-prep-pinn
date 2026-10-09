@@ -13,3 +13,6 @@ feature_manifests/
 eda_outputs/*.tif
 figures/*.tif
 pinn_wave/
+
+# Large GIS output (exceeds GitHub 100 MB limit)
+pinn-dce.gpkg

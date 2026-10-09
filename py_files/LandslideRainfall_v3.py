@@ -35,6 +35,13 @@ numeric_cols = ['Clay_mean',
   'ContributingFactor_mean',
   'type',
   'soil_texture_idx',
+  # Index of the dataset's own `type` map unit (helpers.add_soil_type_index_v3).
+  # Only consumed when geotech_mode="soil_conditioned" and soil_axis="type";
+  # it is skipped from normalization like soil_texture_idx. Both index columns
+  # MUST stay at the end of this list: the physics layers read their inputs as
+  # all_inputs[numeric_cols.index(name)], and skip-normalized columns are absent
+  # from all_inputs, so any entry placed before a physics column shifts it.
+  'soil_type_idx',
   ]
 
 PHYSICS_REQUIRED_COLS = (
@@ -77,9 +84,23 @@ class LandslideRainFallV3():
                  k_table="geotech", k_spread_factor=3.0, trainable_k=True,
                  geotech_mode="unconstrained", lambda_var=0.01,
                  recharge=None, recharge_unit=None,
-                 fos_thickness="fixed"):
+                 fos_thickness="fixed", soil_axis="type"):
         self.depth = depth
         self.aux_weight = aux_weight
+        # Which soil class SoilConditionedGeotechLayerV3 conditions coh/ifi on:
+        #   "texture" (default) — soil_texture_idx, the USDA class measured from
+        #       clay/silt/sand. Preserves the trained v2-8 architecture.
+        #   "type" — soil_type_idx, the dataset's own `type` map-unit label, with
+        #       a 13th "Undifferentiated" class. Requires the caller to pass
+        #       `type_idx_input` to classification_model().
+        # The hydraulic conductivity layer is NOT affected: its Ksat table is
+        # written per USDA texture, so K stays on soil_texture_idx either way.
+        if soil_axis not in SoilConditionedGeotechLayerV3.SOIL_AXES:
+            raise ValueError(
+                f"soil_axis must be one of {SoilConditionedGeotechLayerV3.SOIL_AXES}, "
+                f"got {soil_axis!r}"
+            )
+        self.soil_axis = soil_axis
         # Caps the residual head in logit space: residual = scale * tanh(dense_out)
         # so |residual| <= residual_scale. Forces physics to carry most of the signal;
         # residual can only nudge by up to ~sigmoid(scale) - 0.5 in probability space.
@@ -192,7 +213,8 @@ class LandslideRainFallV3():
         
         self.lambda_var = lambda_var
 
-    def classification_model(self, all_inputs, pga_input, soil_idx_input, encoded_features):
+    def classification_model(self, all_inputs, pga_input, soil_idx_input, encoded_features,
+                             type_idx_input=None):
         """
             Builds the graph for PINN Model v3
             Unconstrained coh/ifi + soil-conditioned K for wetness
@@ -252,14 +274,31 @@ class LandslideRainFallV3():
         x = layers.Dense(units=2, name="geotechnical_param")(x)
         x = layers.LeakyReLU(negative_slope=0.2)(x)
 
+        # Tracked so an unconsumed `soil_type_idx` Input can be sunk below: Keras
+        # functional models reject any declared input with no path to an output.
+        type_idx_consumed = False
+
         if self.geotech_mode == "soil_conditioned":
-            # Per-USDA-texture bounded baselines + bounded residual. The layer reads
+            # Per-soil-class bounded baselines + bounded residual. The layer reads
             # x[:, 0] / x[:, 1] as the cohesion / ifi residuals, same slots the
             # unconstrained layers use, so the Dense head above is unchanged.
+            if self.soil_axis == "type":
+                if type_idx_input is None:
+                    raise ValueError(
+                        'soil_axis="type" needs `type_idx_input` (the soil_type_idx '
+                        "Input). Add 'soil_type_idx' to numerical_cols so "
+                        "_build_input_graph declares it."
+                    )
+                geotech_idx_input = type_idx_input
+                type_idx_consumed = True
+            else:
+                geotech_idx_input = soil_idx_input
+
             coh, ifi = SoilConditionedGeotechLayerV3(
                 lambda_var=self.lambda_var,
+                soil_axis=self.soil_axis,
                 name="soil_geotech_v3",
-            )([soil_idx_input, x])
+            )([geotech_idx_input, x])
             coh =  layers.Activation("linear", name="cohesion_layer")(coh)
             ifi = layers.Activation("linear", name="internal_friction")(ifi)
 
@@ -342,6 +381,13 @@ class LandslideRainFallV3():
         # diagnostic code.
 
         m = layers.Activation("linear", name="m_clip")(m)
+        if type_idx_input is not None and not type_idx_consumed:
+            # Declared but unused (texture axis, or an unconstrained geotech head).
+            # Zero-scale sink keeps it graph-connected and gradient-dead; m is
+            # unchanged, and "m_clip" above still names the diagnostic tensor.
+            type_sink = layers.Rescaling(scale=0.0, name="soil_type_sink")(type_idx_input)
+            m = layers.Add(name="m_type_sink")([m, type_sink])
+
         if self.fos_thickness == "soil_thickness":
             # Same H the wetness layer used for T = K*H, so m = h_w/H and the
             # pore-pressure term refer to the same soil column. See the layer
@@ -387,8 +433,9 @@ class LandslideRainFallV3():
         final = layers.Activation("sigmoid", name="final_head")(combined_logit)
 
         # Option B: multi-output for auxiliary supervision on physics_prob
+        extra_inputs = [] if type_idx_input is None else [type_idx_input]
         self.model = Model(
-            inputs=all_inputs + [pga_input, soil_idx_input],
+            inputs=all_inputs + [pga_input, soil_idx_input] + extra_inputs,
             outputs={"final_head": final, "physics_prob": physics_prob, "fos":fos},
         )
 

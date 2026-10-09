@@ -498,7 +498,7 @@ class DisplacementLayerFOSMakilala(tf.keras.layers.Layer):
         friction_angle = tf.expand_dims(friction_angle, 1)
         m = tf.expand_dims(m, 1)
 
-        unit_weight_freshwater = 9.81
+        unit_weight_freshwater = 9.81 * 1000 #Using N/m^3
 
         safety_factor = (cohesion_t + ((bulk_unit_weight - (m * unit_weight_freshwater)) * slope_normal_thickness * (tf.math.cos(slope) ** 2) * tf.math.tan(friction_angle))) / (((bulk_unit_weight * slope_normal_thickness) * tf.math.sin(slope)*tf.math.cos(slope)) + ((0.5 * (pga / 9.81)) * (bulk_unit_weight * slope_normal_thickness) * (tf.math.cos(slope) ** 2))) 
         ac = (

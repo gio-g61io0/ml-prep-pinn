@@ -710,8 +710,20 @@ class SoilConditionedGeotechLayerV3(tf.keras.layers.Layer):
     Same architecture as SoilConditionedGeotechLayer (v2) but expanded to
     12 USDA soil texture classes instead of 3.
 
-    Input: [soil_texture_idx (batch,1), dense_output (batch,2)]
-    Output: [coh (batch,), ifi (batch,)] — bounded per soil type, with dense residual
+    Input: [soil_class_idx (batch,1), dense_output (batch,2)]
+    Output: [coh (batch,), ifi (batch,)] — bounded per soil class, with dense residual
+
+    ``soil_axis`` selects WHICH soil class the index refers to:
+
+    - ``"texture"`` (default) — ``soil_texture_idx``, the 12 USDA classes derived
+      from measured clay/silt/sand. Unchanged from earlier v3 checkpoints.
+    - ``"type"`` — ``soil_type_idx``, the dataset's own ``type`` map-unit label
+      (``helpers.SOIL_TYPE_TO_IDX_V3``): the same 12 texture names plus a 13th
+      "Undifferentiated" class for labels that carry no composition.
+
+    The two axes disagree per unit (a unit whose `type` reads "Sandy Clay Loam"
+    routinely measures as Clay Loam or Clay), so a model trained on one axis must
+    be fed that same axis at inference.
 
     Also adds a variance regularization loss to prevent collapsed (constant)
     intermediate values.
@@ -749,52 +761,81 @@ class SoilConditionedGeotechLayerV3(tf.keras.layers.Layer):
         11: (0.3142, 0.4363),  # Clay             (18-25°)
     }
 
-    def __init__(self, lambda_var=0.01, residual_scale_coh=5.0, residual_scale_ifi=0.05, **kwargs):
+    # The `type` axis reuses the 12 texture ranges above and appends the
+    # "Undifferentiated" map unit at index 12. Its bounds are the UNION of every
+    # texture range, which is deliberate: the label asserts nothing about
+    # composition, so constraining those units to an invented mid-range prior
+    # would be a physics claim the data does not support. In practice this makes
+    # class 12 effectively unconstrained — which is the honest reading of
+    # "undifferentiated", and worth remembering when interpreting its spread.
+    UNDIFFERENTIATED_COH = (0.0, 50.0)          # union of COH_RANGES
+    UNDIFFERENTIATED_IFI = (0.3142, 0.6632)     # union of IFI_RANGES (18-38 deg)
+
+    TYPE_COH_RANGES = {**COH_RANGES, NUM_SOIL_TYPES: UNDIFFERENTIATED_COH}
+    TYPE_IFI_RANGES = {**IFI_RANGES, NUM_SOIL_TYPES: UNDIFFERENTIATED_IFI}
+
+    SOIL_AXES = ("texture", "type")
+
+    @classmethod
+    def ranges_for_axis(cls, soil_axis):
+        """Return ``(coh_ranges, ifi_ranges, num_classes)`` for a soil axis."""
+        if soil_axis == "texture":
+            return cls.COH_RANGES, cls.IFI_RANGES, NUM_SOIL_TYPES
+        if soil_axis == "type":
+            return cls.TYPE_COH_RANGES, cls.TYPE_IFI_RANGES, NUM_SOIL_TYPES + 1
+        raise ValueError(f"soil_axis must be one of {cls.SOIL_AXES}, got {soil_axis!r}")
+
+    def __init__(self, lambda_var=0.01, residual_scale_coh=5.0, residual_scale_ifi=0.05,
+                 soil_axis="texture", **kwargs):
         kwargs.setdefault("name", "soil_geotech_v3")
         super(SoilConditionedGeotechLayerV3, self).__init__(**kwargs)
         self.lambda_var = lambda_var
         self.residual_scale_coh = residual_scale_coh
         self.residual_scale_ifi = residual_scale_ifi
+        # Defaults to "texture" so checkpoints saved before this parameter existed
+        # deserialize to exactly the layer they were trained as.
+        self.soil_axis = soil_axis
+        coh_ranges, ifi_ranges, self.num_classes = self.ranges_for_axis(soil_axis)
 
         # Build constant tensors for ranges
         self.coh_min = tf.constant(
-            [self.COH_RANGES[i][0] for i in range(NUM_SOIL_TYPES)], dtype=tf.float32
+            [coh_ranges[i][0] for i in range(self.num_classes)], dtype=tf.float32
         )
         self.coh_max = tf.constant(
-            [self.COH_RANGES[i][1] for i in range(NUM_SOIL_TYPES)], dtype=tf.float32
+            [coh_ranges[i][1] for i in range(self.num_classes)], dtype=tf.float32
         )
         self.ifi_min = tf.constant(
-            [self.IFI_RANGES[i][0] for i in range(NUM_SOIL_TYPES)], dtype=tf.float32
+            [ifi_ranges[i][0] for i in range(self.num_classes)], dtype=tf.float32
         )
         self.ifi_max = tf.constant(
-            [self.IFI_RANGES[i][1] for i in range(NUM_SOIL_TYPES)], dtype=tf.float32
+            [ifi_ranges[i][1] for i in range(self.num_classes)], dtype=tf.float32
         )
 
     def build(self, input_shape):
         self.u_coh = self.add_weight(
             name="u_coh",
-            shape=(NUM_SOIL_TYPES,),
+            shape=(self.num_classes,),
             initializer=tf.keras.initializers.Constant(0.0),
             trainable=True,
         )
         self.u_ifi = self.add_weight(
             name="u_ifi",
-            shape=(NUM_SOIL_TYPES,),
+            shape=(self.num_classes,),
             initializer=tf.keras.initializers.Constant(0.0),
             trainable=True,
         )
         super().build(input_shape)
 
     def call(self, inputs):
-        soil_type_idx, dense_output = inputs[0], inputs[1]
+        soil_class_idx, dense_output = inputs[0], inputs[1]
 
         # --- Base values per soil type via sigmoid bounding ---
         base_coh_all = self.coh_min + (self.coh_max - self.coh_min) * tf.nn.sigmoid(self.u_coh)
         base_ifi_all = self.ifi_min + (self.ifi_max - self.ifi_min) * tf.nn.sigmoid(self.u_ifi)
 
         # Select per-sample base values using one_hot
-        soil_idx = tf.cast(tf.reshape(soil_type_idx, [-1]), tf.int32)
-        one_hot = tf.one_hot(soil_idx, depth=NUM_SOIL_TYPES, dtype=tf.float32)
+        soil_idx = tf.cast(tf.reshape(soil_class_idx, [-1]), tf.int32)
+        one_hot = tf.one_hot(soil_idx, depth=self.num_classes, dtype=tf.float32)
 
         base_coh = tf.reduce_sum(one_hot * base_coh_all, axis=-1)  # (batch,)
         base_ifi = tf.reduce_sum(one_hot * base_ifi_all, axis=-1)  # (batch,)
@@ -843,6 +884,7 @@ class SoilConditionedGeotechLayerV3(tf.keras.layers.Layer):
             "lambda_var": self.lambda_var,
             "residual_scale_coh": self.residual_scale_coh,
             "residual_scale_ifi": self.residual_scale_ifi,
+            "soil_axis": self.soil_axis,
         })
         return config
 

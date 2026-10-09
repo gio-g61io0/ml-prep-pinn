@@ -8,7 +8,7 @@ import tensorflow as tf
 from tensorflow.keras.models import load_model
 
 from py_files.data import preprocessing, dataframe_to_dataset
-from py_files.helpers import add_soil_texture_index
+from py_files.helpers import add_soil_texture_index, add_soil_type_index_v3
 
 # Custom layers (needed for deserialization even though they are
 # registered via @register_keras_serializable)
@@ -91,6 +91,26 @@ SOIL_NAMES = [
     "Silty Clay", "Clay",
 ]
 
+# Geotechnical layers summarised per soil type. A collapsed (near identical) range
+# across soil types is the failure mode this table exists to expose.
+PER_SOIL_LAYERS = (
+    ("cohesion", "Cohesion (kPa)"),
+    ("internal_friction", "Int. Friction (rad)"),
+    ("wetness", "Wetness (m)"),
+)
+# Reported alongside min/max so a couple of extreme units don't read as "the range".
+PER_SOIL_PERCENTILES = (5, 50, 95)
+PER_SOIL_CSV = "per_soil_ranges.csv"
+PER_SOIL_BOXPLOT_FIGSIZE = (13, 9)
+# The dataset's own soil-type field, used to group the geotechnical ranges. This is
+# NOT the same axis the physics layers condition on (they index `soil_texture_idx`,
+# the USDA class derived from clay/silt/sand), so the two groupings can disagree —
+# pass --soil-group-col soil_texture to report the layers' own classes instead.
+SOIL_GROUP_COL = "type"
+# `type` is nullable in the source GeoPackages; nulls become their own labelled row
+# rather than silently disappearing from the counts.
+SOIL_GROUP_UNKNOWN = "(no soil type)"
+
 
 def load_and_preprocess(data_path: str):
     """Load GeoPackage, run preprocessing, add soil texture index.
@@ -104,8 +124,13 @@ def load_and_preprocess(data_path: str):
     cols_to_drop = [c for c in COLUMNS_DROP if c in df_full.columns]
     df, columns, numeric_cols = preprocessing(df_full.copy(), columns_drop=cols_to_drop)
     df = add_soil_texture_index(df)
-
+    # Models built with soil_axis="type" declare a `soil_type_idx` input. Derived
+    # unconditionally (it is cheap) so one loader serves both axes; models on the
+    # texture axis simply never ask for the column.
     feature_cols = columns + ["soil_texture_idx"]
+    if "type" in df.columns:
+        df = add_soil_type_index_v3(df)
+        feature_cols = feature_cols + ["soil_type_idx"]
     return df, feature_cols, df_full
 
 
@@ -178,6 +203,124 @@ def learned_conductivity(model):
     k_layer = resolve_layer(model, "conductivity")
     soil_idx = tf.constant(np.arange(len(SOIL_NAMES)).reshape(-1, 1), dtype=tf.float32)
     return k_layer.name, np.asarray(k_layer(soil_idx)).flatten()
+
+
+def soil_group_labels(df, group_col=None):
+    """Return ``(labels, order, description)`` for grouping the geotech ranges.
+
+    ``group_col`` names the dataframe column holding the soil type; it defaults to
+    ``SOIL_GROUP_COL`` and falls back to the USDA texture derived from
+    clay/silt/sand when that column is absent, so the table still renders on data
+    that carries no ``type`` field.
+    """
+    col = group_col or SOIL_GROUP_COL
+    if col not in df.columns:
+        fallback = "soil_texture" if "soil_texture" in df.columns else None
+        if fallback is None:
+            raise KeyError(
+                f"Soil group column '{col}' not in the data and no 'soil_texture' "
+                f"fallback. Columns: {sorted(df.columns)}"
+            )
+        print(f"  [soil groups] '{col}' absent — grouping by '{fallback}' instead")
+        col = fallback
+
+    labels = df[col].astype("object").where(df[col].notna(), SOIL_GROUP_UNKNOWN)
+    labels = labels.astype(str).values
+
+    # Most-populated soil type first: the sparse classes are the ones whose ranges
+    # are least trustworthy, so they belong at the bottom of the table.
+    counts = pd.Series(labels).value_counts()
+    return labels, list(counts.index), col
+
+
+def per_soil_ranges(labels, results, order=None):
+    """Per-soil-type value ranges for cohesion, internal friction and wetness.
+
+    ``labels`` is one soil-type string per slope unit (see ``soil_group_labels``).
+    Non-finite predictions are dropped per layer rather than poisoning the whole
+    row's statistics.
+    """
+    labels = np.asarray(labels).astype(str)
+    order = list(order) if order is not None else list(pd.unique(labels))
+    p_lo, p_mid, p_hi = PER_SOIL_PERCENTILES
+
+    rows = []
+    for name in order:
+        in_class = labels == name
+        row = {"soil": name, "n": int(in_class.sum())}
+        for key, _label in PER_SOIL_LAYERS:
+            values = np.asarray(results[key])[in_class]
+            values = values[np.isfinite(values)]
+            if values.size == 0:
+                stats = (np.nan,) * 5
+            else:
+                stats = (
+                    float(values.min()),
+                    float(np.percentile(values, p_lo)),
+                    float(np.percentile(values, p_mid)),
+                    float(np.percentile(values, p_hi)),
+                    float(values.max()),
+                )
+            for suffix, value in zip(
+                ("min", f"p{p_lo}", "median", f"p{p_hi}", "max"), stats
+            ):
+                row[f"{key}_{suffix}"] = value
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def print_per_soil_ranges(table, group_col=SOIL_GROUP_COL):
+    """Print ``per_soil_ranges`` as one block per layer."""
+    p_lo, _p_mid, p_hi = PER_SOIL_PERCENTILES
+    width = max([len(str(s)) for s in table["soil"]] + [len(group_col), 12])
+    for key, label in PER_SOIL_LAYERS:
+        print(f"\n  {label} per soil type ('{group_col}'):")
+        print(f"    {group_col:{width}s} {'n':>7s} {'min':>10s} {f'p{p_lo}':>10s} "
+              f"{'median':>10s} {f'p{p_hi}':>10s} {'max':>10s}")
+        for _, row in table.iterrows():
+            if row["n"] == 0:
+                print(f"    {row['soil']:{width}s} {0:>7d}  (absent from this dataset)")
+                continue
+            print(
+                f"    {row['soil']:{width}s} {int(row['n']):>7d} "
+                f"{row[f'{key}_min']:>10.4g} {row[f'{key}_p{p_lo}']:>10.4g} "
+                f"{row[f'{key}_median']:>10.4g} {row[f'{key}_p{p_hi}']:>10.4g} "
+                f"{row[f'{key}_max']:>10.4g}"
+            )
+        present = table[table["n"] > 0]
+        if len(present) > 1:
+            spread = present[f"{key}_median"].max() - present[f"{key}_median"].min()
+            print(f"    -> spread of medians across soil types: {spread:.4g}")
+
+
+def save_per_soil_boxplots(labels, results, out_png, order=None, group_col=SOIL_GROUP_COL):
+    """Boxplot of each geotech layer grouped by soil type (one row per layer)."""
+    plt = _pyplot()
+
+    labels = np.asarray(labels).astype(str)
+    order = list(order) if order is not None else list(pd.unique(labels))
+    present = [name for name in order if (labels == name).any()]
+    if not present:
+        raise ValueError(f"No slope unit carries a soil type in '{group_col}'")
+
+    fig, axes = plt.subplots(len(PER_SOIL_LAYERS), 1, figsize=PER_SOIL_BOXPLOT_FIGSIZE)
+    axes = np.atleast_1d(axes).ravel()
+
+    for ax, (key, label) in zip(axes, PER_SOIL_LAYERS):
+        values = np.asarray(results[key])
+        groups = []
+        for name in present:
+            group = values[labels == name]
+            groups.append(group[np.isfinite(group)])
+        ax.boxplot(groups, showfliers=True, flierprops={"markersize": 2, "alpha": 0.3})
+        ax.set_xticks(range(1, len(present) + 1))
+        ax.set_xticklabels(present, rotation=30, ha="right")
+        ax.set_ylabel(label)
+
+    fig.suptitle(f"Geotechnical value ranges per soil type ('{group_col}')")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=FIGURE_DPI, bbox_inches="tight")
+    plt.close(fig)
 
 
 def build_layer_specs(results):
@@ -321,7 +464,9 @@ def save_learned_k_plot(k_m_hr, soil_counts, out_png, layer_name=""):
     plt.close(fig)
 
 
-def save_figures(gdf, layer_specs, k_m_hr, soil_counts, figure_dir, k_layer_name=""):
+def save_figures(gdf, layer_specs, k_m_hr, soil_counts, figure_dir, k_layer_name="",
+                 soil_labels=None, soil_order=None, soil_group_col=SOIL_GROUP_COL,
+                 results=None):
     """Write every PNG for this run into ``figure_dir``.
 
     A failure in one figure is reported and skipped rather than discarding the
@@ -346,6 +491,10 @@ def save_figures(gdf, layer_specs, k_m_hr, soil_counts, figure_dir, k_layer_name
             k_m_hr, soil_counts, p, layer_name=k_layer_name,
         ),
     }
+    if soil_labels is not None and results is not None:
+        extras["geotech_per_soil.png"] = lambda p: save_per_soil_boxplots(
+            soil_labels, results, p, order=soil_order, group_col=soil_group_col,
+        )
     for fname, render in extras.items():
         out_png = os.path.join(figure_dir, fname)
         try:
@@ -530,7 +679,8 @@ def describe(label, values):
 
 
 def run(data_path: str, model_path: str, output_dir: str = None, pixel_size: float = 30.0,
-        figure_dir: str = None, pga_col: str = None, type_col: str = None):
+        figure_dir: str = None, pga_col: str = None, type_col: str = None,
+        soil_group_col: str = None):
     print(f"Loading data from {data_path}")
     df, feature_cols, df_full = load_and_preprocess(data_path)
 
@@ -573,6 +723,8 @@ def run(data_path: str, model_path: str, output_dir: str = None, pixel_size: flo
     for i, name in enumerate(SOIL_NAMES):
         print(f"    {name:20s}: {k_m_hr[i]:.6g} m/hr  ({k_m_hr[i] * M_HR_TO_CM_H:.4g} cm/h)")
 
+    soil_idx = df["soil_texture_idx"].astype(int).values
+
     results = {
         "susceptibility": susceptibility,
         "fos": fos,
@@ -587,15 +739,28 @@ def run(data_path: str, model_path: str, output_dir: str = None, pixel_size: flo
     }
     layer_specs = build_layer_specs(results)
 
+    soil_labels, soil_order, group_col = soil_group_labels(df, soil_group_col)
+    soil_table = per_soil_ranges(soil_labels, results, order=soil_order)
+    print_per_soil_ranges(soil_table, group_col=group_col)
+    results["per_soil_ranges"] = soil_table
+    results["soil_group_col"] = group_col
+
     if figure_dir:
         print(f"\nRendering figures to {figure_dir} …")
-        soil_counts = df["soil_texture_idx"].astype(int).value_counts().to_dict()
+        soil_counts = pd.Series(soil_idx).value_counts().to_dict()
         save_figures(
             df, layer_specs, k_m_hr, soil_counts, figure_dir, k_layer_name=k_layer_name,
+            soil_labels=soil_labels, soil_order=soil_order, soil_group_col=group_col,
+            results=results,
         )
 
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
+
+        # --- Per-soil-type range table (CSV) ---
+        csv_path = os.path.join(output_dir, PER_SOIL_CSV)
+        soil_table.to_csv(csv_path, index=False)
+        print(f"\nWrote per-soil geotechnical ranges to {csv_path}")
 
         # --- Vector export (GeoPackage) ---
         gpkg_path = os.path.join(output_dir, "geotechnical_values.gpkg")
@@ -658,6 +823,14 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--soil-group-col", default=None,
+        help=(
+            f"Column used to group the geotechnical range table (default: '{SOIL_GROUP_COL}', "
+            "the dataset's own soil type). Pass 'soil_texture' to group by the USDA class "
+            "the physics layers actually index instead."
+        ),
+    )
+    parser.add_argument(
         "--figure-dir", default=None,
         help=(
             "Directory for PNG figures (maps, boxplots, histogram, learned-K chart). "
@@ -678,4 +851,5 @@ if __name__ == "__main__":
         figure_dir=figure_dir,
         pga_col=args.pga_col,
         type_col=args.type_col,
+        soil_group_col=args.soil_group_col,
     )

@@ -24,7 +24,12 @@ from .data import (
 import sklearn
 from matplotlib import pyplot as plt
 
-SKIP_NORMALIZATION = {'soil_texture_idx'}
+# Class-index columns: integer codes routed straight into physics layers via
+# one_hot, so normalizing them would silently corrupt the bucket routing.
+SKIP_NORMALIZATION = {'soil_texture_idx', 'soil_type_idx'}
+# Which skip-normalized column feeds which physics layer.
+TEXTURE_IDX_COL = 'soil_texture_idx'
+TYPE_IDX_COL = 'soil_type_idx'
 OOF_FILENAME = 'oof_preds.npy'
 FOLD_MANIFEST_TEMPLATE = 'v1_cotabato_transforms_fold{fold}.json'
 PRODUCTION_MANIFEST = 'v1_cotabato_transforms_production.json'
@@ -123,14 +128,18 @@ def _derive_and_apply_transforms(
 
 
 def _build_input_graph(numerical_cols, categorical_cols, pga_col, train_ds, categorical_encoder):
-    """Build the (all_inputs, pga_input, soil_idx_input, encoded_inputs) tuple.
+    """Build the (all_inputs, pga_input, soil_idx_input, type_idx_input, encoded_inputs) tuple.
 
     Shared by the cross-validation fold loop and the production trainer so both
     construct the physics-layer inputs in exactly the same order (the physics
     layers index ``numeric_cols`` positionally, so ordering must not drift).
+
+    ``type_idx_input`` is ``None`` unless ``soil_type_idx`` is in
+    ``numerical_cols``; it is only consumed when the model is built with
+    ``soil_axis="type"``, and sunk (gradient-dead) otherwise.
     """
     all_inputs, encoded_inputs = [], []
-    pga_input, soil_idx_input = None, None
+    pga_input, soil_idx_input, type_idx_input = None, None, None
 
     for header in numerical_cols:
         numerical_col = tf.keras.Input((1,), name=header)
@@ -138,7 +147,10 @@ def _build_input_graph(numerical_cols, categorical_cols, pga_col, train_ds, cate
             pga_input = tf.keras.Input((1,), name=header)
             continue
         if header in SKIP_NORMALIZATION:
-            soil_idx_input = numerical_col
+            if header == TYPE_IDX_COL:
+                type_idx_input = numerical_col
+            else:
+                soil_idx_input = numerical_col
             continue
         norm = NormalizationLayer(header, train_ds)
         encoded_numeric = norm(numerical_col)
@@ -158,7 +170,7 @@ def _build_input_graph(numerical_cols, categorical_cols, pga_col, train_ds, cate
     if pga_input is None:
         raise ValueError("PGA input is none")
 
-    return all_inputs, pga_input, soil_idx_input, encoded_inputs
+    return all_inputs, pga_input, soil_idx_input, type_idx_input, encoded_inputs
 
 
 def _load_fold_manifest(transforms_dir, fold):
@@ -199,11 +211,12 @@ def train_model_rainfall_v3(
     k_table="geotech",
     k_spread_factor=3.0,
     trainable_k=True,
-    geotech_mode="unconstrained",
+    geotech_mode="soil_conditioned",
     lambda_var=0.01,
     recharge=None,
     recharge_unit=None,
     fos_thickness="fixed",
+    soil_axis="type",
     use_physics_head=True,
 ):
     """
@@ -282,7 +295,7 @@ def train_model_rainfall_v3(
         train_ds = dataframe_to_dataset(train_df[feature_cols], batch_size=batch_size)
         val_ds = dataframe_to_dataset(val_df[feature_cols], shuffle=False, batch_size=batch_size)
 
-        all_inputs, pga_input, soil_idx_input, encoded_inputs = _build_input_graph(
+        all_inputs, pga_input, soil_idx_input, type_idx_input, encoded_inputs = _build_input_graph(
             numerical_cols, categorical_cols, pga_col, train_ds, categorical_encoder,
         )
 
@@ -298,8 +311,12 @@ def train_model_rainfall_v3(
         recharge=recharge,
         recharge_unit=recharge_unit,
         fos_thickness=fos_thickness,
+        soil_axis=soil_axis,
     )
-        model.classification_model(all_inputs, pga_input, soil_idx_input, encoded_inputs)
+        model.classification_model(
+            all_inputs, pga_input, soil_idx_input, encoded_inputs,
+            type_idx_input=type_idx_input,
+        )
         model.get_optimizer()
 
         # Wrap into dual-head datasets with per-sample weights (multi-output
@@ -447,6 +464,7 @@ def train_production_rainfall_v3(
     recharge=None,
     recharge_unit=None,
     fos_thickness="fixed",
+    soil_axis="texture",
 ):
     """Train a single production PINN v3 model on the full v2-8 training set.
 
@@ -511,7 +529,7 @@ def train_production_rainfall_v3(
         holdout_df[feature_cols], shuffle=False, batch_size=batch_size,
     )
 
-    all_inputs, pga_input, soil_idx_input, encoded_inputs = _build_input_graph(
+    all_inputs, pga_input, soil_idx_input, type_idx_input, encoded_inputs = _build_input_graph(
         numerical_cols, categorical_cols, pga_col, train_ds, categorical_encoder,
     )
 
@@ -527,8 +545,12 @@ def train_production_rainfall_v3(
         recharge=recharge,
         recharge_unit=recharge_unit,
         fos_thickness=fos_thickness,
+        soil_axis=soil_axis,
     )
-    model.classification_model(all_inputs, pga_input, soil_idx_input, encoded_inputs)
+    model.classification_model(
+        all_inputs, pga_input, soil_idx_input, encoded_inputs,
+        type_idx_input=type_idx_input,
+    )
     model.get_optimizer()
     model.compile_model_dce()
 

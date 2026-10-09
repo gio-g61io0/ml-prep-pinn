@@ -145,6 +145,41 @@ def add_soil_texture_index(df, clay_col='Clay_mean', silt_col='Silt_mean', sand_
     return df
 
 
+# --- v3 soil-type axis (the dataset's own `type` column) ---------------------
+# Every observed `type` value across the Cotabato GeoPackages is a USDA texture
+# name except "Undifferentiated", so the texture indices are reused verbatim and
+# the unknown class is appended. Keeping the indices aligned with
+# SOIL_TEXTURE_TO_IDX means the same COH/IFI range tables serve both axes.
+UNDIFFERENTIATED_NAME = 'Undifferentiated'
+UNDIFFERENTIATED_IDX = len(SOIL_TEXTURE_TO_IDX)  # 12
+SOIL_TYPE_TO_IDX_V3 = {**SOIL_TEXTURE_TO_IDX, UNDIFFERENTIATED_NAME: UNDIFFERENTIATED_IDX}
+NUM_SOIL_TYPE_CLASSES_V3 = len(SOIL_TYPE_TO_IDX_V3)  # 13
+
+
+def add_soil_type_index_v3(df, type_col='type'):
+    """Add ``soil_type_idx`` from the dataset's own ``type`` soil-map label.
+
+    Unlike ``add_soil_texture_index`` (which derives the USDA class from measured
+    clay/silt/sand), this reads the categorical map-unit label. Nulls and any
+    label outside ``SOIL_TYPE_TO_IDX_V3`` fall back to the Undifferentiated class
+    rather than to a texture, because an unrecognized map unit says nothing about
+    composition — the caller sees how many landed there in the printed count.
+    """
+    if type_col not in df.columns:
+        raise KeyError(
+            f"'{type_col}' not in the dataframe; cannot derive soil_type_idx. "
+            f"Columns: {sorted(df.columns)}"
+        )
+    mapped = df[type_col].map(SOIL_TYPE_TO_IDX_V3)
+    n_unmapped = int(mapped.isna().sum())
+    if n_unmapped:
+        unknown = sorted(set(df.loc[mapped.isna(), type_col].dropna().astype(str)))
+        print(f"  [soil_type_idx] {n_unmapped} rows -> {UNDIFFERENTIATED_NAME} "
+              f"(nulls and unmapped labels {unknown})")
+    df['soil_type_idx'] = mapped.fillna(UNDIFFERENTIATED_IDX).astype(int)
+    return df
+
+
 SOIL_TYPE_TO_IDX = {
     'Sandy Clay Loam': 0,
     'Loam': 1,
