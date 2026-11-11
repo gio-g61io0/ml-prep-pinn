@@ -1,11 +1,13 @@
 import tensorflow as tf
 from tensorflow.keras import layers, Model, optimizers, metrics, losses
-from py_files.GallenModel import CriticalAcceleration, DisplacementIntermediate, FosLayer
+from py_files.GallenModel import CriticalAcceleration, DisplacementIntermediate, FosLayer, FosLayerProbability
 from py_files.GallenModel_v1 import DisplacementLayerRainFall, NewmarkActivation, WetnessLayer, CohesionLayer, InternalFrictionLayer
 from py_files.GallenModel_v3 import (
-    FOSConsistencyLoss, HydraulicConductivityLayerV3, WetnessRatioLayer,
+    FOSConsistencyLoss, HydraulicConductivityLayerV3, WetnessLayerDimensionalFeatureLambda, WetnessRatioLayer,
     WetnessLayerDimensional, WetnessLayerFixedRecharge, HydraulicConductivityLayerCms,
-    SoilConditionedGeotechLayerV3, DisplacementLayerRainFallV3,
+    SoilConditionedGeotechLayerV3, DisplacementLayerRainFallV3, BoundedCohesionLayer,
+    LearnableNewmarkActivation,
+    BULK_UNIT_TO_KN_M3, SATURATION_MODES, ACPG_CLAMPS, NEWMARK_THRESHOLDS,
 )
 from py_files.Landslidev2_Old import DiceCrossEntropyLoss, FOSPhysicsLoss
 
@@ -79,12 +81,17 @@ class LandslideRainFallV3():
        supervision to prevent physics collapse.
     """
 
+    HEADS = ("hybrid", "physics")
+
     def __init__(self, depth=8, aux_weight=0.7, residual_scale=3.0, use_rainfall=True,
                  wetness_mode="conductivity", dem_cell_size_m=5.0,
                  k_table="geotech", k_spread_factor=3.0, trainable_k=True,
                  geotech_mode="unconstrained", lambda_var=0.01,
                  recharge=None, recharge_unit=None,
-                 fos_thickness="fixed", soil_axis="type"):
+                 fos_thickness="fixed", soil_axis="type",
+                 geotech_exclude=("Prc_mean",), wetness_saturation="sigmoid",
+                 bulk_density_unit="kN/m3", head="hybrid",
+                 cohesion_max_kpa=None, acpg_clamp="hard", newmark_threshold="fixed"):
         self.depth = depth
         self.aux_weight = aux_weight
         # Which soil class SoilConditionedGeotechLayerV3 conditions coh/ifi on:
@@ -137,9 +144,9 @@ class LandslideRainFallV3():
         #       the wetness scenario should be an explicit, sweepable modelling
         #       choice. Requires `recharge` and `recharge_unit`; the wetness path
         #       then has NO fitted scalar at all.
-        if wetness_mode not in ("conductivity", "rt_ratio", "dimensional", "fixed_recharge"):
+        if wetness_mode not in ("conductivity", "rt_ratio", "dimensional", "fixed_recharge", "dimensional_feature_lambda"):
             raise ValueError(
-                "wetness_mode must be 'conductivity', 'rt_ratio', 'dimensional' or "
+                "wetness_mode must be 'conductivity', 'rt_ratio', 'dimensional', 'dimensional_feature_lambda' or "
                 f"'fixed_recharge', got {wetness_mode!r}"
             )
         self.wetness_mode = wetness_mode
@@ -212,6 +219,77 @@ class LandslideRainFallV3():
         self.geotech_mode = geotech_mode
         
         self.lambda_var = lambda_var
+        # Inputs hidden from the geotechnical MLP that predicts cohesion / friction.
+        # Default ("Prc_mean",) is the v2-8 behaviour (rainfall reaches FOS only via m).
+        # Cohesion and friction are soil properties: letting the MLP see Slope_mean
+        # lets it make phi a function of slope (r = 0.82 in the v2-8 grid model), so
+        # FOS = tan(phi(slope))/tan(slope) becomes a free curve that the physics no
+        # longer constrains and that does not transfer between areas.
+        self.geotech_exclude = tuple(geotech_exclude)
+        # Bound on the steady-state saturation ratio; "sigmoid" is the legacy floor
+        # at m = 0.5, "clip" the documented clip(m, 0, 1). See SATURATION_MODES.
+        if wetness_saturation not in SATURATION_MODES:
+            raise ValueError(
+                f"wetness_saturation must be one of {SATURATION_MODES}, got {wetness_saturation!r}"
+            )
+        if wetness_saturation != "sigmoid" and wetness_mode not in ("dimensional", "fixed_recharge", "dimensional_feature_lambda"):
+            raise ValueError(
+                "wetness_saturation only applies to wetness_mode 'dimensional' or "
+                f"'fixed_recharge', got wetness_mode={wetness_mode!r}"
+            )
+        self.wetness_saturation = wetness_saturation
+        # Unit of BUK_mean as fed to the FOS: "kN/m3" (a unit weight, SU_17) or
+        # "cg/cm3" (SoilGrids bulk density, the 25 m grid datasets).
+        if bulk_density_unit not in BULK_UNIT_TO_KN_M3:
+            raise ValueError(
+                f"bulk_density_unit must be one of {sorted(BULK_UNIT_TO_KN_M3)}, "
+                f"got {bulk_density_unit!r}"
+            )
+        if bulk_density_unit != "kN/m3" and fos_thickness != "soil_thickness":
+            raise ValueError(
+                "bulk_density_unit conversion is implemented in DisplacementLayerRainFallV3 "
+                "only; use fos_thickness='soil_thickness'"
+            )
+        self.bulk_density_unit = bulk_density_unit
+        # Output head:
+        #   "hybrid"  — v2-8: final = sigmoid(logit(physics_prob) + bounded residual DNN),
+        #       with physics_prob and the FOS probability as auxiliary outputs.
+        #   "physics" — physics_prob IS the prediction: no residual branch, no logit
+        #       recombination, no FOS output. Still exposed under the "final_head" key
+        #       so inference and OOF are unchanged. As the only output its metrics are
+        #       unprefixed (val_auc, not val_final_head_auc); see self.monitor.
+        if head not in self.HEADS:
+            raise ValueError(f"head must be one of {self.HEADS}, got {head!r}")
+        self.head = head
+        # Keras prefixes metrics with the output name only for multi-output models.
+        self.monitor = "val_auc" if head == "physics" else "val_final_head_auc"
+        # None (default) = v2-8's unbounded relu CohesionLayer; a number bounds the
+        # unconstrained cohesion to [0, cohesion_max_kpa] via BoundedCohesionLayer.
+        if cohesion_max_kpa is not None:
+            if geotech_mode != "unconstrained":
+                raise ValueError(
+                    "cohesion_max_kpa only applies to geotech_mode='unconstrained' "
+                    f"(soil_conditioned has its own bounds), got {geotech_mode!r}"
+                )
+            if cohesion_max_kpa <= 0:
+                raise ValueError(f"cohesion_max_kpa must be positive, got {cohesion_max_kpa!r}")
+        self.cohesion_max_kpa = cohesion_max_kpa
+        # "hard" (default, v2-8) or "soft" ac/PGA clamp; see GallenModel_v3.ACPG_CLAMPS.
+        if acpg_clamp not in ACPG_CLAMPS:
+            raise ValueError(f"acpg_clamp must be one of {ACPG_CLAMPS}, got {acpg_clamp!r}")
+        if acpg_clamp != "hard" and fos_thickness != "soil_thickness":
+            raise ValueError(
+                "acpg_clamp='soft' is implemented in DisplacementLayerRainFallV3 only; "
+                "use fos_thickness='soil_thickness'"
+            )
+        self.acpg_clamp = acpg_clamp
+        # "fixed" (default, v2-8) = sigmoid(D - 5 cm); "learnable" = learned D0 and
+        # slope on ln D. See GallenModel_v3.NEWMARK_THRESHOLDS.
+        if newmark_threshold not in NEWMARK_THRESHOLDS:
+            raise ValueError(
+                f"newmark_threshold must be one of {NEWMARK_THRESHOLDS}, got {newmark_threshold!r}"
+            )
+        self.newmark_threshold = newmark_threshold
 
     def classification_model(self, all_inputs, pga_input, soil_idx_input, encoded_features,
                              type_idx_input=None):
@@ -236,16 +314,25 @@ class LandslideRainFallV3():
         # WetnessLayer → m → DisplacementLayerRainFall. Without this cut, the Dense head
         # learns a shortcut (Prc → coh/IFI) that bypasses the physics and fails to
         # generalize to gentle-slope, high-rainfall pixels (the FN cluster).
-        prc_idx = numeric_cols.index("Prc_mean")
+        # Matched by input NAME: encoded_features pairs 1:1 with all_inputs, which
+        # omits the PGA and skip-normalized inputs, so numeric_cols positions drift.
+        encoded_names = [t.name for t in all_inputs]
+        unknown = [c for c in self.geotech_exclude if c not in encoded_names]
+        if unknown:
+            raise ValueError(
+                f"geotech_exclude names not among the encoded inputs: {unknown}. "
+                f"Encoded inputs: {encoded_names}"
+            )
         geotech_features = tf.keras.layers.concatenate(
-            [f for i, f in enumerate(encoded_features) if i != prc_idx]
+            [f for name, f in zip(encoded_names, encoded_features)
+             if name not in self.geotech_exclude]
         )
 
-        # Pure-EIL: also keep rainfall out of the residual DNN branch (it would
-        # otherwise re-enter via `features_only = all_features`). Fall back to the
-        # Prc-excluded concat so precipitation has NO path to the output.
+        #Removes rainfall data as a direct input into the model
         if not self.use_rainfall:
-            features_only = geotech_features
+            features_only = tf.keras.layers.concatenate(
+                [f for name, f in zip(encoded_names, encoded_features) if name != "Prc_mean"]
+            )
 
         slope = all_inputs[numeric_cols.index("Slope_mean")]
         bulk_unit_weight = all_inputs[numeric_cols.index("BUK_mean")]
@@ -304,7 +391,10 @@ class LandslideRainFallV3():
 
         else:
             # Unconstrained cohesion and internal friction
-            coh = CohesionLayer()(x)
+            if self.cohesion_max_kpa is None:
+                coh = CohesionLayer()(x)
+            else:
+                coh = BoundedCohesionLayer(max_kpa=self.cohesion_max_kpa)(x)
             ifi = InternalFrictionLayer()(x)
 
         # --- Wetness index m ---------------------------------------------------
@@ -325,8 +415,14 @@ class LandslideRainFallV3():
                 bias_initializer="random_normal",
             )(features_only)
             r_head = layers.LeakyReLU(negative_slope=0.2)(r_head)
-            r_raw = layers.Dense(1, name="recharge_head")(r_head)  # per-pixel recharge logit
-            m = WetnessRatioLayer()([r_raw, contributing_area, soil_thickness, slope, k])
+            r_t = layers.Dense(1, name="recharge_head")(r_head)  # per-pixel recharge logit
+            # r_t = layers.Activation("sigmoid")(r_t) #Ratio r/t
+
+            m = WetnessRatioLayer()([r_t, contributing_area, slope])
+
+            k_sink = layers.Rescaling(scale=0.0, name="soil_idx_sink")(k)
+            m = layers.Add(name="m_rt_soil_sink")([m, k_sink])
+            
             # Precip now enters via features_only -> recharge_head; soil_idx via k;
             # soil_thickness via T. In pure-EIL (use_rainfall=False) features_only
             # excludes precip, so precipitation would be graph-disconnected — keep it
@@ -346,7 +442,9 @@ class LandslideRainFallV3():
                 k_table=self.k_table, spread_factor=self.k_spread_factor,
                 trainable_k=self.trainable_k,
             )(soil_idx_input)
-            m = WetnessLayerDimensional(cell_size_m=self.dem_cell_size_m)(
+            m = WetnessLayerDimensional(
+                cell_size_m=self.dem_cell_size_m, saturation=self.wetness_saturation,
+            )(
                 [precipitation, contributing_area, soil_thickness, slope, k]
             )
         elif self.wetness_mode == "fixed_recharge":
@@ -362,7 +460,14 @@ class LandslideRainFallV3():
                 recharge=self.recharge,
                 recharge_unit=self.recharge_unit,
                 cell_size_m=self.dem_cell_size_m,
+                saturation=self.wetness_saturation,
             )([precipitation, contributing_area, soil_thickness, slope, k])
+        elif self.wetness_mode == "dimensional_feature_lambda":
+            k = HydraulicConductivityLayerCms(
+                k_table=self.k_table, spread_factor=self.k_spread_factor,
+                trainable_k=self.trainable_k,
+            )(soil_idx_input)
+            m = WetnessLayerDimensionalFeatureLambda(lambda_init=0.09, recharge_unit=self.recharge_unit)([precipitation, contributing_area, soil_thickness, slope, k, geotech_features])
         else:
             # Default: soil-conditioned K for wetness only.
             k = HydraulicConductivityLayerV3()(soil_idx_input)
@@ -392,17 +497,46 @@ class LandslideRainFallV3():
             # Same H the wetness layer used for T = K*H, so m = h_w/H and the
             # pore-pressure term refer to the same soil column. See the layer
             # docstring and the `fos_thickness` note in __init__.
-            ds, fos, critical_acceleration, acpg = DisplacementLayerRainFallV3()(
+            ds, fos, critical_acceleration, acpg = DisplacementLayerRainFallV3(
+                unit_weight_scale=BULK_UNIT_TO_KN_M3[self.bulk_density_unit],
+                acpg_clamp=self.acpg_clamp,
+            )(
                 [coh, ifi, slope, pga_input, bulk_unit_weight, m, soil_thickness]
             )
         else:
             ds, fos, critical_acceleration, acpg = DisplacementLayerRainFall()([coh, ifi, slope, pga_input, bulk_unit_weight, m])
         fos = FosLayer()(fos)
+        fos_prob = FosLayerProbability()(fos)
         ac, acpg = CriticalAcceleration()(critical_acceleration, acpg)
         ds = DisplacementIntermediate()(ds)
 
         # Physics-only probability (auxiliary output)
-        physics_prob = NewmarkActivation(threshold=5.0, name="physics_prob")(ds, fos, ac, acpg)
+        if self.newmark_threshold == "learnable":
+            physics_prob = LearnableNewmarkActivation(d0_init_cm=5.0, name="physics_prob")(ds)
+        else:
+            physics_prob = NewmarkActivation(threshold=5.0, name="physics_prob")(ds, fos_prob, ac, acpg)
+        extra_inputs = [] if type_idx_input is None else [type_idx_input]
+        model_inputs = all_inputs + [pga_input, soil_idx_input] + extra_inputs
+
+        if self.head == "physics":
+            # Encoded inputs hidden from the geotech MLP (e.g. Elev_mean) reached the
+            # output only through the residual branch. Keras functional models reject
+            # a declared input with no path to an output, so keep each connected with
+            # a zero-scale, gradient-dead sink — the prediction is physics_prob exactly.
+            sinks = [
+                layers.Rescaling(scale=0.0, name=f"unused_sink_{name}")(feature)
+                for name, feature in zip(encoded_names, encoded_features)
+                if name in self.geotech_exclude and feature.shape[-1] == 1
+            ]
+            # Same trick for fos_layer: with the learnable threshold nothing downstream
+            # uses FOS, so Keras would prune it and get_layer("fos_layer") would fail.
+            # tanh first so an infinite FOS gives 0, not 0 * inf = NaN.
+            fos_bounded = layers.Activation("tanh", name="fos_sink_tanh")(fos)
+            sinks.append(layers.Rescaling(scale=0.0, name="fos_sink")(fos_bounded))
+            prediction = layers.Add(name="physics_with_sinks")([physics_prob] + sinks) if sinks else physics_prob
+            final = layers.Activation("linear", name="final_head")(prediction)
+            self.model = Model(inputs=model_inputs, outputs={"final_head": final})
+            return
 
         # Residual DNN branch (unregularized; allows symmetric corrections)
         res = layers.Dense(
@@ -433,10 +567,9 @@ class LandslideRainFallV3():
         final = layers.Activation("sigmoid", name="final_head")(combined_logit)
 
         # Option B: multi-output for auxiliary supervision on physics_prob
-        extra_inputs = [] if type_idx_input is None else [type_idx_input]
         self.model = Model(
-            inputs=all_inputs + [pga_input, soil_idx_input] + extra_inputs,
-            outputs={"final_head": final, "physics_prob": physics_prob, "fos":fos},
+            inputs=model_inputs,
+            outputs={"final_head": final, "physics_prob": physics_prob, "fos":fos_prob},
         )
 
     @staticmethod
@@ -474,8 +607,13 @@ class LandslideRainFallV3():
             outputs["residual"] = model.get_layer("residual_dense2").output
         return Model(inputs=model.inputs, outputs=outputs)
 
+    @property
+    def output_keys(self):
+        """Label keys the compiled model trains on (see ``to_multi_output_ds``)."""
+        return ("final_head",) if self.head == "physics" else ("final_head", "physics_prob")
+
     @staticmethod
-    def to_multi_output_ds(ds, class_weight=None):
+    def to_multi_output_ds(ds, class_weight=None, output_keys=("final_head", "physics_prob")):
         """Replicate single-label dataset into dict labels for dual-head training.
 
         If class_weight is provided (e.g. {0: 1, 1: 5}) the dataset also emits
@@ -484,7 +622,7 @@ class LandslideRainFallV3():
         multi-output models).
         """
         if class_weight is None:
-            return ds.map(lambda x, y: (x, {"final_head": y, "physics_prob": y}))
+            return ds.map(lambda x, y: (x, {key: y for key in output_keys}))
 
         w0 = tf.constant(float(class_weight[0]), dtype=tf.float32)
         w1 = tf.constant(float(class_weight[1]), dtype=tf.float32)
@@ -494,8 +632,8 @@ class LandslideRainFallV3():
             sw = y_f * w1 + (1.0 - y_f) * w0
             return (
                 x,
-                {"final_head": y, "physics_prob": y},
-                {"final_head": sw, "physics_prob": sw},
+                {key: y for key in output_keys},
+                {key: sw for key in output_keys},
             )
 
         return ds.map(_attach)
@@ -518,6 +656,20 @@ class LandslideRainFallV3():
                     "accuracy",
                 ],
                 "physics_prob": [metrics.AUC(name="auc")],
+            },
+        )
+
+    def compile_model_physics(self):
+        """Single-output compile for head="physics": Dice-CE on physics_prob."""
+        self.model.compile(
+            optimizer=self.optimizer_instance,
+            loss={"final_head": DiceCrossEntropyLoss()},
+            metrics={
+                "final_head": [
+                    metrics.BinaryIoU(target_class_ids=[0, 1], threshold=0.5),
+                    metrics.AUC(name="auc"),
+                    "accuracy",
+                ],
             },
         )
 

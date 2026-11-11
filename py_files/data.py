@@ -296,6 +296,25 @@ def check_feature_correlation(df, numeric_cols, threshold=0.9):
         print(f"  No feature pairs with |r| > {threshold}")
     return result
 
+def spatial_block_ids(geometry, block_size_m):
+    """Id of the square ``block_size_m`` block holding each geometry's centroid.
+
+    For spatial cross-validation (``train_rainfall_v3.cv_splits``): cells sharing an
+    id stay in the same fold. ``geometry`` must be in a projected CRS in metres.
+    """
+    if block_size_m <= 0:
+        raise ValueError(f"block_size_m must be positive, got {block_size_m!r}")
+    crs = geometry.crs
+    if crs is None or crs.is_geographic or crs.axis_info[0].unit_name not in ("metre", "meter"):
+        raise ValueError(f"spatial_block_ids needs a projected CRS in metres, got {crs}")
+    centres = geometry.centroid
+    block_xy = np.column_stack([
+        np.floor(centres.x.to_numpy() / block_size_m),
+        np.floor(centres.y.to_numpy() / block_size_m),
+    ]).astype(np.int64)
+    return np.unique(block_xy, axis=0, return_inverse=True)[1].ravel()
+
+
 def manipulate_cols(columns, remove_cols) -> List:
     return [col for col in columns if col not in remove_cols]
 
@@ -323,11 +342,16 @@ def dataframe_to_dataset_multi(df, shuffle=True, batch_size=128, seed=None):
 
 
 def dataframe_to_dataset(df, shuffle=True, batch_size=32, seed=None):
-    labels = df.pop('landslide')
-    ds = tf.data.Dataset.from_tensor_slices((dict(df), labels))
-    if shuffle:
-        ds = ds.shuffle(buffer_size=len(df), seed=seed)
-    ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    try:
+
+        labels = df.pop('landslide')
+        ds = tf.data.Dataset.from_tensor_slices((dict(df), labels))
+        if shuffle:
+            ds = ds.shuffle(buffer_size=len(df), seed=seed)
+        ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    except  TypeError as type_exc:
+        print(f"TypeError: {type_exc.args.index}. Check if the dataframe has the correct columns and data types.")
+        raise
     return ds
 
 def dataframe_to_dataset_no_pga(df, shuffle=True, batch_size=32, seed=None):

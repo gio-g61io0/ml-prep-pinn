@@ -1,13 +1,12 @@
 import os
 import json
 from pathlib import Path
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold, train_test_split
 import numpy as np
 import tensorflow as tf
 from . import LandslideRainfall_v3 as _lr3
 from .LandslideRainfall_v3 import (
     LandslideRainFallV3,
-    PhysicsModel,
     BaseModelCheckpoint,
 )
 
@@ -31,6 +30,12 @@ SKIP_NORMALIZATION = {'soil_texture_idx', 'soil_type_idx'}
 TEXTURE_IDX_COL = 'soil_texture_idx'
 TYPE_IDX_COL = 'soil_type_idx'
 OOF_FILENAME = 'oof_preds.npy'
+# Validation fold (1..N_FOLDS) of every training row, saved next to the checkpoints
+# so OOF regeneration reuses the exact split (spatial folds can't be re-derived
+# from the labels alone).
+CV_FOLDS_FILENAME = 'cv_folds.npy'
+N_FOLDS = 5
+CV_SEED = 42
 FOLD_MANIFEST_TEMPLATE = 'v1_cotabato_transforms_fold{fold}.json'
 PRODUCTION_MANIFEST = 'v1_cotabato_transforms_production.json'
 PRODUCTION_MODEL_FILENAME = 'production-model-v3.keras'
@@ -187,6 +192,37 @@ def _load_fold_manifest(transforms_dir, fold):
     return log_cols, thresholds
 
 
+def cv_splits(labels, spatial_groups=None):
+    """(train_idx, val_idx) for each of N_FOLDS folds.
+
+    ``spatial_groups=None`` is the original random StratifiedKFold. Otherwise each
+    row's spatial block id (``py_files.data.spatial_block_ids``): whole blocks go to
+    one fold (StratifiedGroupKFold), so a validation cell's neighbours are not in
+    training, and the folds' landslide rates are kept as close as the blocks allow.
+    """
+    labels = np.asarray(labels)
+    if spatial_groups is None:
+        splitter = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=CV_SEED)
+        return list(splitter.split(labels, labels))
+    groups = np.asarray(spatial_groups)
+    if len(groups) != len(labels):
+        raise ValueError(f"spatial_groups has {len(groups):,} entries for {len(labels):,} rows")
+    n_blocks = len(np.unique(groups))
+    if n_blocks < N_FOLDS:
+        raise ValueError(f"{n_blocks} spatial blocks cannot fill {N_FOLDS} folds; use a smaller block size")
+    splitter = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=CV_SEED)
+    return list(splitter.split(labels, labels, groups))
+
+
+def describe_splits(splits, labels, spatial_groups=None):
+    """Per-fold validation size and landslide rate (and block count when spatial)."""
+    labels = np.asarray(labels)
+    for fold, (_, val_idx) in enumerate(splits, start=1):
+        blocks = "" if spatial_groups is None else f", {len(np.unique(np.asarray(spatial_groups)[val_idx]))} blocks"
+        print(f"  Fold {fold} validation: {len(val_idx):,} rows{blocks}, "
+              f"{int(labels[val_idx].sum()):,} landslides ({labels[val_idx].mean():.2%})")
+
+
 def train_model_rainfall_v3(
     df,
     numerical_cols,
@@ -217,20 +253,27 @@ def train_model_rainfall_v3(
     recharge_unit=None,
     fos_thickness="fixed",
     soil_axis="type",
-    use_physics_head=True,
+    geotech_exclude=("Prc_mean",),
+    wetness_saturation="sigmoid",
+    bulk_density_unit="kN/m3",
+    head="hybrid",
+    cohesion_max_kpa=None,
+    acpg_clamp="hard",
+    newmark_threshold="fixed",
+    spatial_groups=None,
 ):
     """
-        Trains rainfall PINN model v3 using stratified KFold.
-        Unconstrained coh/ifi + HydraulicConductivityLayerV3 for wetness
-        with 12 USDA soil texture classes.
+        Trains rainfall PINN model v3 using stratified KFold, or spatial block CV
+        when ``spatial_groups`` (one block id per ``df`` row, see ``cv_splits``)
+        is given. The fold of every row is saved as ``cv_folds.npy``.
 
-        ``use_physics_head`` (default True) trains each fold with the production
-        architecture: the functional model is wrapped in ``PhysicsModel``, which
-        adds the FOS -> final physics loss (aux/fos weights 0.4/0.6) and monitors
-        ``val_loss`` (``PhysicsModel`` does not expose ``val_final_head_auc``).
-        The best-weight base functional model is saved so downstream loaders and
-        ``load_or_regenerate_oof`` stay compatible. Set False to fall back to the
-        plain Dice-CE functional model monitored on ``val_final_head_auc``.
+        ``geotech_exclude`` / ``wetness_saturation`` / ``bulk_density_unit`` /
+        ``head`` / ``cohesion_max_kpa`` / ``acpg_clamp`` / ``newmark_threshold``
+        pass through to ``LandslideRainFallV3``; their defaults reproduce the v2-8
+        model. ``head="physics"`` trains physics_prob alone (no residual branch, no
+        FOS output). Every fold is checkpointed and early-stopped on the model's
+        validation AUC (``LandslideRainFallV3.monitor``: ``val_auc`` for the
+        single-output physics head, ``val_final_head_auc`` for hybrid).
 
         When ``physics_features`` is provided, log-transform and 1/99-percentile
         clipping are derived **inside** each fold from the fold's own training
@@ -247,7 +290,14 @@ def train_model_rainfall_v3(
     # against the SAME ordering used to build all_inputs / encoded_inputs.
     _lr3.numeric_cols = list(numerical_cols)
 
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    splits = cv_splits(df['landslide'], spatial_groups)
+    print(f"{'Spatial block' if spatial_groups is not None else 'Stratified random'} {N_FOLDS}-fold CV:")
+    describe_splits(splits, df['landslide'], spatial_groups)
+    cv_folds = np.zeros(df.shape[0], dtype=np.int8)
+    for fold_number, (_, val_idx) in enumerate(splits, start=1):
+        cv_folds[val_idx] = fold_number
+    os.makedirs(path, exist_ok=True)
+    np.save(os.path.join(path, CV_FOLDS_FILENAME), cv_folds)
 
     predictions = np.zeros(df.shape[0])
     mean_fpr = np.linspace(0, 1, 100)
@@ -256,7 +306,7 @@ def train_model_rainfall_v3(
 
     class_weight = {0: 1, 1: 5}
 
-    for train_idx, val_idx in skf.split(df, df['landslide']):
+    for train_idx, val_idx in splits:
         # `.copy()` so the in-place mutations inside `log_transform_skewed` /
         # `clip_outliers` never reach the caller's `df`.
         train_df = df.iloc[train_idx].copy()
@@ -312,6 +362,13 @@ def train_model_rainfall_v3(
         recharge_unit=recharge_unit,
         fos_thickness=fos_thickness,
         soil_axis=soil_axis,
+        geotech_exclude=geotech_exclude,
+        wetness_saturation=wetness_saturation,
+        bulk_density_unit=bulk_density_unit,
+        head=head,
+        cohesion_max_kpa=cohesion_max_kpa,
+        acpg_clamp=acpg_clamp,
+        newmark_threshold=newmark_threshold,
     )
         model.classification_model(
             all_inputs, pga_input, soil_idx_input, encoded_inputs,
@@ -319,77 +376,47 @@ def train_model_rainfall_v3(
         )
         model.get_optimizer()
 
-        # Wrap into dual-head datasets with per-sample weights (multi-output
-        # models don't support the class_weight kwarg of fit()).
-        train_ds_mo = LandslideRainFallV3.to_multi_output_ds(train_ds, class_weight=class_weight)
-        # PhysicsModel.{train,test}_step unpack a 3-tuple (x, y, sample_weight),
-        # so under the physics head the val set must also carry per-sample
-        # weights (matches cotabato_production_train.ipynb cell 16). The plain
-        # functional path keeps the unweighted 2-tuple val set.
-        val_ds_mo = LandslideRainFallV3.to_multi_output_ds(
-            val_ds, class_weight=class_weight if use_physics_head else None,
+        # Dict-label datasets matching the model's outputs, with per-sample weights
+        # (multi-output models don't support the class_weight kwarg of fit()).
+        train_ds_mo = LandslideRainFallV3.to_multi_output_ds(
+            train_ds, class_weight=class_weight, output_keys=model.output_keys,
         )
+        val_ds_mo = LandslideRainFallV3.to_multi_output_ds(val_ds, output_keys=model.output_keys)
 
         fold_path = f"{path}/fold-{fold}-model-v3.keras"
 
-        if use_physics_head:
-            # Production architecture (cotabato_production_train.ipynb cells 14/16):
-            # wrap the functional model in PhysicsModel so training adds the
-            # FOS -> final physics loss. PhysicsModel.test_step exposes only
-            # loss/final_head_loss/fos_loss, so we monitor val_loss (not
-            # val_final_head_auc). The base functional model is saved after fit
-            # (restore_best_weights already left the best weights in place) so the
-            # on-disk checkpoint equals the model that produced the OOF preds and
-            # stays loadable exactly like the old plain-model checkpoints.
-            trainer = PhysicsModel(base_model=model.model)
-            trainer.compile(optimizer=model.optimizer_instance)
-            trainer.fit(
-                train_ds_mo,
-                epochs=epochs,
-                batch_size=batch_size,
-                validation_data=val_ds_mo,
-                callbacks=[
-                    tf.keras.callbacks.EarlyStopping(
-                        monitor="val_loss",
-                        mode="min",
-                        patience=5,
-                        restore_best_weights=True,
-                    ),
-                ],
-            )
-            model.model.save(fold_path)
-            y_true = val_df['landslide']
-            validation_preds = trainer.predict(val_ds_mo)["final_head"].flatten()
+        if head == "physics":
+            model.compile_model_physics()
         else:
             model.compile_model_dce()
 
-            model_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
-                fold_path,
-                monitor="val_final_head_auc",
-                save_best_only=True,
-                save_weights_only=False,
-                mode="max",
-                save_freq="epoch",
-                verbose=0,
-            )
+        model_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
+            fold_path,
+            monitor=model.monitor,
+            save_best_only=True,
+            save_weights_only=False,
+            mode="max",
+            save_freq="epoch",
+            verbose=0,
+        )
 
-            model.model.fit(
-                train_ds_mo,
-                epochs=epochs,
-                batch_size=batch_size,
-                validation_data=val_ds_mo,
-                callbacks=[
-                    tf.keras.callbacks.EarlyStopping(
-                        monitor="val_final_head_auc",
-                        mode="max",
-                        patience=5,
-                        restore_best_weights=True,
-                    ),
-                    model_checkpoint_callback,
-                ],
-            )
-            y_true = val_df['landslide']
-            validation_preds = model.model.predict(val_ds_mo)["final_head"].flatten()
+        model.model.fit(
+            train_ds_mo,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_data=val_ds_mo,
+            callbacks=[
+                tf.keras.callbacks.EarlyStopping(
+                    monitor=model.monitor,
+                    mode="max",
+                    patience=5,
+                    restore_best_weights=True,
+                ),
+                model_checkpoint_callback,
+            ],
+        )
+        y_true = val_df['landslide']
+        validation_preds = model.model.predict(val_ds_mo)["final_head"].flatten()
 
         predictions[val_idx] = validation_preds
 
@@ -423,7 +450,7 @@ def train_model_rainfall_v3(
     )
     plt.xlabel("False Positive Rate")
     plt.ylabel("True Positive Rate")
-    plt.title("Per-fold ROC — 5-fold CV")
+    plt.title(f"Per-fold ROC — {N_FOLDS}-fold {'spatial block' if spatial_groups is not None else 'stratified'} CV")
     plt.legend(loc="lower right")
     plt.show()
 
@@ -611,10 +638,22 @@ def regenerate_oof_predictions(df, feature_cols, path: str, batch_size=128, *, t
     from tensorflow.keras.models import load_model
     from py_files.GallenModel_v1 import NewmarkActivation
 
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    # The saved fold assignment is the only way to reproduce a spatial split;
+    # runs from before it existed were always stratified random.
+    folds_path = os.path.join(path, CV_FOLDS_FILENAME)
+    if os.path.exists(folds_path):
+        cv_folds = np.load(folds_path)
+        if len(cv_folds) != len(df):
+            raise ValueError(
+                f"{folds_path} has {len(cv_folds):,} rows but df has {len(df):,}; "
+                "re-run preprocessing with the settings used for training."
+            )
+        val_indices = [np.flatnonzero(cv_folds == fold) for fold in range(1, N_FOLDS + 1)]
+    else:
+        val_indices = [val_idx for _, val_idx in cv_splits(df['landslide'])]
     predictions = np.zeros(df.shape[0])
 
-    for fold, (_, val_idx) in enumerate(skf.split(df, df['landslide']), start=1):
+    for fold, val_idx in enumerate(val_indices, start=1):
         ckpt_path = os.path.join(path, f"fold-{fold}-model-v3.keras")
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(

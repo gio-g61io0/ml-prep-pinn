@@ -1,0 +1,20 @@
+{
+  "susceptibility_raster": "E:/MLPREP/MLPREP/Objectives/Objective 2/Algorithms/Sampe Data/Input/Makilala_Susceptibility.tif",
+  "cohesion_raster": "E:/MLPREP/MLPREP/Objectives/Objective 2/Algorithms/Sampe Data/Input/Makilala_Cohesion.tif",
+  "friction_angle_raster": "E:/MLPREP/MLPREP/Objectives/Objective 2/Algorithms/Sampe Data/Input/Makilala_IFA.tif",
+  "saturation_ratio_raster": "E:/MLPREP/MLPREP/Objectives/Objective 2/Algorithms/Sampe Data/Input/Makilala_Wetness.tif",
+  "total_unit_weight_raster": "E:/MLPREP/MLPREP/Objectives/Objective 2/Algorithms/Sampe Data/Input/Makilala_BulkDensity.tif",
+  "slope_angle_raster": "../../../Sample Data/Input/Raster/Predictors/Topographic/Filtered/Makilala_Slope_LPF_PRSTM51N.tif",
+  "friction_angle_unit": "radians",
+  "total_unit_weight_band": 1,
+  "total_unit_weight_scale_to_kn_m3": 0.0981,
+  "total_unit_weight_resampling": "bilinear",
+  "fos_threshold": 1.5,
+  "output_fos_raster": "../../../Sample Data/Output/Latest Runs/Data Preparation/FoS Source Refinement/cell_scale_factor_of_safety.tif",
+  "output_source_mask_raster": "../../../Sample Data/Output/Latest Runs/Data Preparation/FoS Source Refinement/refined_source_mask.tif",
+  "output_summary_json": "../../../Sample Data/Output/Latest Runs/Data Preparation/FoS Source Refinement/source_refinement_summary.json",
+  "float_nodata": -9999.0,
+  "mask_nodata": 255,
+  "block_rows": 256,
+  "overwrite": false
+}

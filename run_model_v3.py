@@ -1,13 +1,23 @@
 
 import argparse
+import json
 import os
+import re
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 import tensorflow as tf
 from tensorflow.keras.models import load_model
 
-from py_files.data import preprocessing, dataframe_to_dataset
+from py_files.data import (
+    MISSINGNESS_SUFFIX,
+    apply_clip_thresholds,
+    apply_imputation_medians,
+    apply_log_transform,
+    apply_missingness_indicators,
+    dataframe_to_dataset,
+    preprocessing,
+)
 from py_files.helpers import add_soil_texture_index, add_soil_type_index_v3
 
 # Custom layers (needed for deserialization even though they are
@@ -110,15 +120,25 @@ SOIL_GROUP_COL = "type"
 # `type` is nullable in the source GeoPackages; nulls become their own labelled row
 # rather than silently disappearing from the counts.
 SOIL_GROUP_UNKNOWN = "(no soil type)"
+# Per-fold transform manifests written by train_model_rainfall_v3.
+TRANSFORMS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feature_manifests")
+TRANSFORMS_MANIFEST_NAME = "v1_cotabato_transforms_fold{fold}.json"
+FOLD_PATTERN = re.compile(r"fold-(\d+)-model")
 
 
-def load_and_preprocess(data_path: str):
+def load_and_preprocess(data_path: str, bbox=None, rows=None):
     """Load GeoPackage, run preprocessing, add soil texture index.
+
+    ``bbox`` = ``(minx, miny, maxx, maxy)`` in the file's CRS reads only the
+    features intersecting it (via the GeoPackage spatial index), so a sub-area of
+    a province-sized grid never has to be loaded whole. ``rows`` (a ``slice``)
+    reads that range of features instead, for chunking a whole file; preprocessing
+    is row-wise, so chunks give the same rows as one full load.
 
     Returns the preprocessed GeoDataFrame, feature columns, and the
     *full* (unfiltered) GeoDataFrame for gap-free rasterization.
     """
-    df_full = gpd.read_file(data_path)
+    df_full = gpd.read_file(data_path, bbox=bbox, rows=rows)
 
     # Drop columns that exist in the dataframe (some may not be present)
     cols_to_drop = [c for c in COLUMNS_DROP if c in df_full.columns]
@@ -330,7 +350,7 @@ def build_layer_specs(results):
     ``vmin``/``vmax`` of ``None`` means "derive from the data percentiles".
     """
     return {
-        "susceptibility": (results["susceptibility"], "Susceptibility", "plasma_r", 0.0, 1.0),
+        "susceptibility": (results["susceptibility"], "Susceptibility", "RdYlGn_r", 0.0, 1.0),
         "cohesion": (results["cohesion"], "Cohesion (kPa)", "viridis", None, None),
         "internal_friction": (
             results["internal_friction"], "Internal Friction Angle (rad)", "viridis", None, None,
@@ -624,7 +644,11 @@ def build_model_inputs(df, model, pga_col=None, type_col=None):
         resolved[string_slots[0]] = type_col
         missing = [c for c in missing if c != string_slots[0]]
 
-    pga_slots = [c for c in required if "PGA" in c.upper()]
+    # `PGA2_max_was_imputed` is a 0/1 missingness flag, not a PGA value.
+    pga_slots = [
+        c for c in required
+        if "PGA" in c.upper() and not c.endswith(MISSINGNESS_SUFFIX)
+    ]
     if pga_col:
         if pga_col not in df.columns:
             raise KeyError(f"--pga-col '{pga_col}' not in the data. Columns: {sorted(df.columns)}")
@@ -657,6 +681,69 @@ def build_model_inputs(df, model, pga_col=None, type_col=None):
     return out
 
 
+def find_transforms_manifest(model_path):
+    """Locate the fold manifest for ``fold-<N>-model-v3.keras``, or None.
+
+    A copy next to the checkpoint wins over the shared ``feature_manifests/`` one,
+    because every training run overwrites the shared files.
+    """
+    match = FOLD_PATTERN.search(os.path.basename(model_path))
+    if match is None:
+        return None
+    name = TRANSFORMS_MANIFEST_NAME.format(fold=match.group(1))
+    for directory in (os.path.dirname(os.path.abspath(model_path)), TRANSFORMS_DIR):
+        candidate = os.path.join(directory, name)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def replay_transforms(df, model, transforms_path=None):
+    """Replay a training fold's transform manifest onto ``df`` (a copy is returned).
+
+    Models trained by ``train_model_rainfall_v3`` see log1p'd / clipped features and
+    ``*_was_imputed`` indicator inputs, all decided per fold and saved to
+    ``feature_manifests/v1_cotabato_transforms_fold{N}.json``. Feeding raw values
+    instead is silent training-serving skew (e.g. raw metres into an input trained
+    on log1p(Elev_mean)), so a model with indicator inputs refuses to run without
+    the manifest. Order mirrors the notebook: indicators -> medians -> log -> clip.
+    """
+    required = [t.name for t in model.inputs]
+    indicator_inputs = [c for c in required if c.endswith(MISSINGNESS_SUFFIX)]
+    if transforms_path is None:
+        if indicator_inputs:
+            raise ValueError(
+                f"Model declares imputation-indicator inputs {indicator_inputs}, so it was "
+                "trained with a per-fold transform manifest. Pass --transforms "
+                "feature_manifests/v1_cotabato_transforms_fold<N>.json for the fold "
+                "matching --model (fold-<N>-model-v3.keras)."
+            )
+        return df
+
+    with open(transforms_path) as f:
+        manifest = json.load(f)
+    log_cols = manifest.get("log_transformed_cols", [])
+    clip_thresholds = manifest.get("clip_thresholds", {})
+    print(f"  Replaying transforms from {transforms_path} "
+          f"({manifest.get('version', 'unversioned')}): log1p {log_cols}, "
+          f"clip {sorted(clip_thresholds)}")
+
+    manifest_indicators = manifest.get("imputed_indicator_cols", [])
+    if sorted(manifest_indicators) != sorted(indicator_inputs):
+        raise ValueError(
+            f"Manifest {transforms_path} lists indicators {manifest_indicators}, but the "
+            f"model declares {indicator_inputs} — it belongs to a different training run. "
+            "Pass --transforms with the manifest saved alongside this model."
+        )
+
+    out = df.copy()
+    out = apply_missingness_indicators(out, indicator_inputs)
+    out = apply_imputation_medians(out, manifest.get("imputation_medians", {}))
+    out = apply_log_transform(out, log_cols)
+    out = apply_clip_thresholds(out, clip_thresholds)
+    return out
+
+
 def describe(label, values):
     """Print nan-safe stats for a physics layer, naming any non-finite rows.
 
@@ -680,7 +767,7 @@ def describe(label, values):
 
 def run(data_path: str, model_path: str, output_dir: str = None, pixel_size: float = 30.0,
         figure_dir: str = None, pga_col: str = None, type_col: str = None,
-        soil_group_col: str = None):
+        soil_group_col: str = None, transforms_path: str = None):
     print(f"Loading data from {data_path}")
     df, feature_cols, df_full = load_and_preprocess(data_path)
 
@@ -692,7 +779,14 @@ def run(data_path: str, model_path: str, output_dir: str = None, pixel_size: flo
     model = load_trained_model(model_path)
     model.summary()
 
-    feed_df = build_model_inputs(df, model, pga_col=pga_col, type_col=type_col)
+    if transforms_path is None:
+        transforms_path = find_transforms_manifest(model_path)
+        if transforms_path:
+            print(f"  --transforms not given; using {transforms_path} (matched by fold number)")
+
+    # Transformed copy feeds the model; `df` keeps raw values for maps and exports.
+    model_df = replay_transforms(df, model, transforms_path)
+    feed_df = build_model_inputs(model_df, model, pga_col=pga_col, type_col=type_col)
     ds = dataframe_to_dataset(feed_df, shuffle=False, batch_size=BATCH_SIZE)
 
     susceptibility = predict_susceptibility(model, ds)
@@ -831,6 +925,15 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--transforms", default=None,
+        help=(
+            "Per-fold transform manifest written during training "
+            "(feature_manifests/v1_cotabato_transforms_fold<N>.json). Defaults to the "
+            "manifest matching the fold in --model's filename (a copy beside the model "
+            "first, then feature_manifests/). Needed for models with *_was_imputed inputs."
+        ),
+    )
+    parser.add_argument(
         "--figure-dir", default=None,
         help=(
             "Directory for PNG figures (maps, boxplots, histogram, learned-K chart). "
@@ -852,4 +955,5 @@ if __name__ == "__main__":
         pga_col=args.pga_col,
         type_col=args.type_col,
         soil_group_col=args.soil_group_col,
+        transforms_path=args.transforms,
     )

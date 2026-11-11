@@ -1,3 +1,4 @@
+from matplotlib import scale
 import tensorflow as tf
 from tensorflow.keras import layers
 import numpy as np
@@ -340,24 +341,23 @@ class WetnessRatioLayer(tf.keras.layers.Layer):
         self.use_log_area = use_log_area
 
     def call(self, inputs):
-        r_raw, contributing_area, soil_thickness, slope, k = (
-            inputs[0], inputs[1], inputs[2], inputs[3], inputs[4]
+        r_t, contributing_area, slope= (
+            inputs[0], inputs[1], inputs[2]
         )
-        # k arrives as (batch,) from HydraulicConductivityLayerV3; match (batch,1).
-        k = tf.expand_dims(k, -1)
         # Convert slope degrees -> radians; floor sin to avoid divide-by-zero on flats.
         slope_rad = slope * 0.017453292519943295
         sin_slope = tf.maximum(tf.math.sin(slope_rad), 1e-6)
         # Per-pixel recharge R (m/hr): free logit bounded log-uniformly into
         # [r_min, r_max] so equal steps in r_raw are equal ratio steps in R.
-        log_min = tf.math.log(tf.constant(self.r_min, dtype=tf.float32))
-        log_max = tf.math.log(tf.constant(self.r_max, dtype=tf.float32))
-        r = tf.exp(log_min + (log_max - log_min) * tf.nn.sigmoid(r_raw))
+        # log_min = tf.math.log(tf.constant(self.r_min, dtype=tf.float32))
+        # log_max = tf.math.log(tf.constant(self.r_max, dtype=tf.float32))
+        # r = tf.exp(log_min + (log_max - log_min) * tf.nn.sigmoid(r_raw))
         # Per-pixel transmissivity T = K · soil_thickness (m²/hr); floor to avoid /0.
-        t = tf.maximum(k * soil_thickness, 1e-10)
+        # t = tf.maximum(k * soil_thickness, 1e-10)
         area = tf.math.log1p(contributing_area) if self.use_log_area else contributing_area
-        m = (r / t) * area / sin_slope
-        m = tf.clip_by_value(m, 0.0, 1.0)
+        x = r_t * (area / sin_slope)
+        # m = tf.clip_by_value(m, 0.0, 1.0)
+        m = tf.tanh(x)
         return m
 
     def get_config(self):
@@ -387,9 +387,33 @@ RECHARGE_UNIT_TO_M_PER_HR = {
     "mm/yr": 1e-3 / 8760.0,
 }
 
+# How the raw ratio R*a/(T*sin θ) >= 0 is bounded to a saturation fraction:
+#   "sigmoid" — legacy; maps the ratio into [0.5, 1), so a dry column (ratio 0)
+#       still reads half-saturated. Kept as the default so checkpoints trained
+#       with it reload bit-identically.
+#   "clip"    — the documented physics, clip(ratio, 0, 1): dry = 0, saturated = 1.
+SATURATION_MODES = ("sigmoid", "clip")
+
+# Bulk input unit -> multiplier to unit weight in kN/m^3 (gamma = rho * g).
+# cg/cm^3 (SoilGrids bdod) / 100 = g/cm^3 = t/m^3; x 9.81 m/s^2 = kN/m^3.
+BULK_UNIT_TO_KN_M3 = {
+    "kN/m3": 1.0,
+    "cg/cm3": 9.81 / 100.0,
+}
+
+
+def bound_saturation(ratio, saturation):
+    """Bound a non-negative saturation ratio to a fraction (see SATURATION_MODES)."""
+    if saturation == "clip":
+        return tf.clip_by_value(ratio, 0.0, 1.0)
+    if saturation == "sigmoid":
+        return tf.sigmoid(ratio)
+    raise ValueError(f"saturation must be one of {SATURATION_MODES}, got {saturation!r}")
+
 
 def steady_state_saturation(r, contributing_area, soil_thickness, slope,
-                            k, cell_size_m, min_soil_thickness_m, scale):
+                            k, cell_size_m, min_soil_thickness_m, scale,
+                            saturation="sigmoid"):
     """Steady-state saturation ratio m = h_w / H, shared by the dimensional wetness layers.
 
     Implements ``m = clip(scale * R * a / (T * sin θ), 0, 1)`` — see
@@ -429,8 +453,9 @@ def steady_state_saturation(r, contributing_area, soil_thickness, slope,
     # Saturation ratio h_w/H. Every factor's units cancel: (m/hr * m) / (m^2/hr).
     m = scale * (r * a) / (t * sin_slope)
     # m > 1 is physically "saturated to the surface", so clipping is the model,
-    # not a rescaling trick.
-    return tf.sigmoid(m)
+    # not a rescaling trick. `saturation="sigmoid"` is the legacy variant, which
+    # floors every column at m = 0.5 (see SATURATION_MODES).
+    return bound_saturation(m, saturation)
 
 
 @tf.keras.utils.register_keras_serializable()
@@ -540,9 +565,12 @@ class WetnessLayerDimensional(tf.keras.layers.Layer):
     """
 
     def __init__(self, cell_size_m=5.0, lambda_min=0.0, lambda_max=1.0,
-                 u_lambda_init=-2.3, min_soil_thickness_m=0.5, **kwargs):
+                 u_lambda_init=-2.3, min_soil_thickness_m=0.5, saturation="sigmoid", **kwargs):
         kwargs.setdefault("name", "wetness_layer_dimensional")
         super(WetnessLayerDimensional, self).__init__(**kwargs)
+        if saturation not in SATURATION_MODES:
+            raise ValueError(f"saturation must be one of {SATURATION_MODES}, got {saturation!r}")
+        self.saturation = saturation
         self.cell_size_m = cell_size_m
         self.lambda_min = lambda_min
         self.lambda_max = lambda_max
@@ -581,6 +609,7 @@ class WetnessLayerDimensional(tf.keras.layers.Layer):
         return steady_state_saturation(
             r, contributing_area, soil_thickness, slope, k,
             self.cell_size_m, self.min_soil_thickness_m, scale,
+            saturation=self.saturation,
         )
 
     def get_config(self):
@@ -591,6 +620,7 @@ class WetnessLayerDimensional(tf.keras.layers.Layer):
             "lambda_max": self.lambda_max,
             "u_lambda_init": self.u_lambda_init,
             "min_soil_thickness_m": self.min_soil_thickness_m,
+            "saturation": self.saturation,
         })
         return config
 
@@ -598,6 +628,56 @@ class WetnessLayerDimensional(tf.keras.layers.Layer):
     def from_config(cls, config):
         return cls(**config)
 
+@tf.keras.utils.register_keras_serializable()
+class WetnessLayerDimensionalFeatureLambda(tf.keras.layers.Layer):
+    def __init__(self,lambda_init, recharge_unit, lambda_min = 0, lambda_max = 1, **kwargs):
+        super().__init__(**kwargs)
+
+        # Validation
+        # if recharge_unit not in RECHARGE_UNIT_TO_M_PER_HR:
+        #     raise ValueError(f"recharge_unit must be one of {list(RECHARGE_UNIT_TO_M_PER_HR.keys())}, got {recharge_unit!r}")
+        self.u_lambda_init = lambda_init
+        self.lambda_min = lambda_min
+        self.lambda_max = lambda_max
+        self.recharge_unit = recharge_unit
+
+        self.hidden = [tf.keras.layers.Dense(16, activation='relu') for i in range(5)]
+    def build(self, input_shape):
+        x_shape = input_shape[5]
+        n_features = x_shape[-1]
+        
+        self.n_features = n_features
+
+        self.output_head = tf.keras.layers.Dense(self.n_features, activation='relu')
+
+        shape = x_shape
+
+        for layer in self.hidden:
+            layer.build(shape)
+            shape = layer.compute_output_shape(shape)
+
+        self.output_head.build(shape)
+        self.w_lambda = self.add_weight(name="w_lambda", shape=(n_features, 1), initializer="zeros", trainable=True)
+        self.b_lambda = self.add_weight(name="b_lambda", shape=(1,), initializer=tf.keras.initializers.Constant(self.u_lambda_init), trainable=True)
+       
+        
+    def call(self, inputs):
+        prec, contributing_factor, soil_thickness, slope, k, x = inputs
+        
+        #A hidden dense layer for (batch, 16) input to learn a feature-based lambda
+        for layer in self.hidden:
+            x = layer(x)
+
+        #Output head that produces (batch, n_features)
+        x = self.output_head(x)
+
+        #(batch, n_features) x (n_features, 1) weight vector
+        z = tf.matmul(x, self.w_lambda) + self.b_lambda  #Outputshape (batch, 1). Each cell has its own z value
+
+        #Every row in a batch have its own scale (each cell have their own scale)        
+        scale = self.lambda_min + (self.lambda_max - self.lambda_min) * tf.nn.sigmoid(z)
+        r = prec * RECHARGE_UNIT_TO_M_PER_HR["mm/month"]
+        return steady_state_saturation(r, contributing_factor, soil_thickness=soil_thickness, slope=slope, k=k, cell_size_m=5.0, min_soil_thickness_m=0.5, scale=scale, saturation="sigmoid")
 
 @tf.keras.utils.register_keras_serializable()
 class WetnessLayerFixedRecharge(tf.keras.layers.Layer):
@@ -656,7 +736,7 @@ class WetnessLayerFixedRecharge(tf.keras.layers.Layer):
     """
 
     def __init__(self, recharge, recharge_unit, cell_size_m=5.0,
-                 min_soil_thickness_m=0.5, **kwargs):
+                 min_soil_thickness_m=0.5, saturation="sigmoid", **kwargs):
         kwargs.setdefault("name", "wetness_layer_fixed_recharge")
         super(WetnessLayerFixedRecharge, self).__init__(**kwargs)
         # Both are required with no default: a wrong recharge unit rescales m by up to
@@ -676,6 +756,9 @@ class WetnessLayerFixedRecharge(tf.keras.layers.Layer):
         # Converted once at construction; stored so diagnostics can read the value
         # the physics actually used rather than re-deriving the conversion.
         self.recharge_m_per_hr = self.recharge * RECHARGE_UNIT_TO_M_PER_HR[recharge_unit]
+        if saturation not in SATURATION_MODES:
+            raise ValueError(f"saturation must be one of {SATURATION_MODES}, got {saturation!r}")
+        self.saturation = saturation
 
     def call(self, inputs):
         # inputs[0] is precipitation — present for graph connectivity only (see the
@@ -686,6 +769,7 @@ class WetnessLayerFixedRecharge(tf.keras.layers.Layer):
         return steady_state_saturation(
             self.recharge_m_per_hr, contributing_area, soil_thickness, slope, k,
             self.cell_size_m, self.min_soil_thickness_m, scale=1.0,
+            saturation=self.saturation,
         )
 
     def get_config(self):
@@ -693,6 +777,7 @@ class WetnessLayerFixedRecharge(tf.keras.layers.Layer):
         config.update({
             "recharge": self.recharge,
             "recharge_unit": self.recharge_unit,
+            "saturation": self.saturation,
             "cell_size_m": self.cell_size_m,
             "min_soil_thickness_m": self.min_soil_thickness_m,
         })
@@ -894,6 +979,118 @@ class SoilConditionedGeotechLayerV3(tf.keras.layers.Layer):
 
 
 @tf.keras.utils.register_keras_serializable()
+class BoundedCohesionLayer(tf.keras.layers.Layer):
+    """Cohesion (kPa) = max_kpa * sigmoid(x[..., 0]) — a bounded ``CohesionLayer``.
+
+    The v1 ``CohesionLayer`` is a bare relu. With gamma in kN/m^3 corrected for the
+    grid's cg/cm^3 bulk density the cohesion term is ~10x larger per kPa, and the
+    unbounded relu drifted to 55-70 kPa (v2-9 grid, folds 1/3): FOS rose until
+    ac/PGA sat above the displacement clip for ~98% of cells and the gradient died.
+    The sigmoid keeps cohesion inside [0, max_kpa] and starts it at max_kpa / 2.
+    Same name and input slot as ``CohesionLayer``, so diagnostics read it unchanged.
+    """
+
+    def __init__(self, max_kpa=30.0, **kwargs):
+        kwargs.setdefault("name", "cohesion_layer")
+        super().__init__(**kwargs)
+        if max_kpa <= 0:
+            raise ValueError(f"max_kpa must be positive, got {max_kpa!r}")
+        self.max_kpa = float(max_kpa)
+
+    def call(self, inputs):
+        return self.max_kpa * tf.nn.sigmoid(inputs[..., 0])
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"max_kpa": self.max_kpa})
+        return config
+
+
+# How displacement becomes physics_prob:
+#   "fixed"     — NewmarkActivation: sigmoid(D - 5 cm). The only way to lower every
+#       prediction is to raise cohesion / phi everywhere, which pins cells at the
+#       displacement floor and erases their ranking (v2-9 grid: phi 28 -> 53 deg in
+#       8 epochs while mean p fell 0.42 -> 0.07 and AUC dropped).
+#   "learnable" — LearnableNewmarkActivation: a learned critical displacement D0 and
+#       slope a carry the calibration, so the geotech parameters only carry ranking.
+NEWMARK_THRESHOLDS = ("fixed", "learnable")
+
+
+@tf.keras.utils.register_keras_serializable()
+class LearnableNewmarkActivation(tf.keras.layers.Layer):
+    """p = sigmoid(a * (ln D - ln D0)) = D^a / (D^a + D0^a), D in cm.
+
+    D0 (critical displacement, cm) and a > 0 are scalar weights, so p is still a
+    monotone function of the Newmark displacement alone. Working in ln D spreads the
+    0.002-0.5 cm range that sigmoid(D - 5) maps to a flat ~0.007. Starts at
+    D0 = d0_init_cm, a = slope_init (with the defaults, p = D / (D + 5)).
+    """
+
+    def __init__(self, d0_init_cm=5.0, slope_init=1.0, **kwargs):
+        kwargs.setdefault("name", "physics_prob")
+        super().__init__(**kwargs)
+        if d0_init_cm <= 0 or slope_init <= 0:
+            raise ValueError(
+                f"d0_init_cm and slope_init must be positive, got {d0_init_cm!r}, {slope_init!r}"
+            )
+        self.d0_init_cm = float(d0_init_cm)
+        self.slope_init = float(slope_init)
+
+    def build(self, input_shape):
+        self.log_d0 = self.add_weight(
+            name="log_d0", shape=(),
+            initializer=tf.keras.initializers.Constant(np.log(self.d0_init_cm)),
+        )
+        # softplus^-1(slope_init) so a = softplus(u_a) starts at slope_init.
+        self.u_a = self.add_weight(
+            name="u_a", shape=(),
+            initializer=tf.keras.initializers.Constant(np.log(np.expm1(self.slope_init))),
+        )
+
+    @property
+    def critical_displacement_cm(self):
+        return float(tf.exp(self.log_d0))
+
+    @property
+    def slope(self):
+        return float(tf.nn.softplus(self.u_a))
+
+    def call(self, displacement_cm):
+        log_d = tf.math.log(tf.maximum(displacement_cm, 1e-6))
+        return tf.sigmoid(tf.nn.softplus(self.u_a) * (log_d - self.log_d0))
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"d0_init_cm": self.d0_init_cm, "slope_init": self.slope_init})
+        return config
+
+
+# How DisplacementLayerRainFallV3 keeps ac/PGA inside the Jibson regression's domain:
+#   "hard" — clip_by_value(acpg, 0.05, 0.75), the v1 bounds. Zero gradient outside.
+#   "soft" — identity inside [0.05, 0.75]; outside, a rational tail that approaches
+#       a hard limit (0.025 / 0.95) with a gradient that decays only as 1/d^2, so
+#       saturated cells still pull cohesion / phi back. ac is also left signed
+#       (FOS < 1 -> ac < 0) inside the clamp instead of relu'd to 0.
+ACPG_CLAMPS = ("hard", "soft")
+ACPG_LO, ACPG_HI = 0.05, 0.75
+# Tail widths: the soft clamp never leaves (ACPG_LO - LO_TAIL, ACPG_HI + HI_TAIL),
+# which stays inside (0, 1) where (1 - acpg)^2.341 * acpg^-1.438 is defined.
+ACPG_LO_TAIL, ACPG_HI_TAIL = 0.025, 0.2
+
+
+def soft_clamp(x, lo, hi, lo_tail, hi_tail):
+    """C1 clamp: identity on [lo, hi], tails lo - w*d/(d+w) and hi + w*d/(d+w)."""
+    above = tf.nn.relu(x - hi)
+    below = tf.nn.relu(lo - x)
+    inside = tf.clip_by_value(x, lo, hi)
+    return (
+        inside
+        + hi_tail * above / (above + hi_tail)
+        - lo_tail * below / (below + lo_tail)
+    )
+
+
+@tf.keras.utils.register_keras_serializable()
 class DisplacementLayerRainFallV3(tf.keras.layers.Layer):
     """Newmark displacement with the failure-slab thickness read PER UNIT.
 
@@ -932,10 +1129,18 @@ class DisplacementLayerRainFallV3(tf.keras.layers.Layer):
     see the SAME thickness for the same unit -- which is the whole point of this layer.
     """
 
-    def __init__(self, min_thickness_m=0.5, **kwargs):
+    def __init__(self, min_thickness_m=0.5, unit_weight_scale=1.0, acpg_clamp="hard", **kwargs):
         kwargs.setdefault("name", "displacement_rainfall_v3")
         super(DisplacementLayerRainFallV3, self).__init__(**kwargs)
+        if acpg_clamp not in ACPG_CLAMPS:
+            raise ValueError(f"acpg_clamp must be one of {ACPG_CLAMPS}, got {acpg_clamp!r}")
+        self.acpg_clamp = acpg_clamp
         self.min_thickness_m = min_thickness_m
+        # Multiplier taking the bulk input to kN/m^3. 1.0 (default) = the input is
+        # already a unit weight, as in SU_17's BUK_mean. SoilGrids bulk density in
+        # cg/cm^3 needs BULK_UNIT_TO_KN_M3["cg/cm3"]; fed raw it makes gamma ~10x too
+        # large, which shrinks the cohesion term and the pore-pressure ratio gamma_w/gamma.
+        self.unit_weight_scale = unit_weight_scale
 
     def call(self, inputs):
         cohesion_t, friction_angle, slope, pga, bulk_density, m, soil_thickness = (
@@ -945,7 +1150,7 @@ class DisplacementLayerRainFallV3(tf.keras.layers.Layer):
         slope = slope * 0.017453292519943295
         pga = pga * 9.81
         cohesion_t = cohesion_t * 1000.0            # kPa -> Pa
-        bulk_density = bulk_density * 1000.0        # kN/m^3 -> N/m^3
+        bulk_density = bulk_density * self.unit_weight_scale * 1000.0  # -> kN/m^3 -> N/m^3
 
         # The one substantive change from v1: H per unit, not the 3.33 m constant.
         thickness = tf.maximum(soil_thickness, self.min_thickness_m)
@@ -964,13 +1169,16 @@ class DisplacementLayerRainFallV3(tf.keras.layers.Layer):
                / (bulk_density * tf.math.tan(slope)))
         )
 
-        ac = (safety_factor - 1) * 9.81 * tf.math.sin(slope)
-        ac = layers.ReLU()(ac)
+        signed_ac = (safety_factor - 1) * 9.81 * tf.math.sin(slope)
+        ac = layers.ReLU()(signed_ac)
 
-        acpg = ac / pga
-        # Same bounds as v1: 0.05 caps displacement at ~135 cm, 0.75 lets stable
-        # slopes reach ~0.12 cm. See DisplacementLayerRainFall for the derivation.
-        acpg = tf.clip_by_value(acpg, 0.05, 0.75)
+        if self.acpg_clamp == "soft":
+            # Signed ac so FOS < 1 cells keep a gradient; see ACPG_CLAMPS.
+            acpg = soft_clamp(signed_ac / pga, ACPG_LO, ACPG_HI, ACPG_LO_TAIL, ACPG_HI_TAIL)
+        else:
+            # Same bounds as v1: 0.05 caps displacement at ~135 cm, 0.75 lets stable
+            # slopes reach ~0.12 cm. See DisplacementLayerRainFall for the derivation.
+            acpg = tf.clip_by_value(ac / pga, ACPG_LO, ACPG_HI)
 
         powcomp = tf.math.pow((1 - acpg), 2.341) * tf.math.pow(acpg, -1.438)
         logds = 0.215 + tf.math.log(powcomp) + 0.51
@@ -979,7 +1187,11 @@ class DisplacementLayerRainFallV3(tf.keras.layers.Layer):
 
     def get_config(self):
         config = super().get_config()
-        config.update({"min_thickness_m": self.min_thickness_m})
+        config.update({
+            "min_thickness_m": self.min_thickness_m,
+            "unit_weight_scale": self.unit_weight_scale,
+            "acpg_clamp": self.acpg_clamp,
+        })
         return config
 
     @classmethod

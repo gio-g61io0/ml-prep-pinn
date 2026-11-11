@@ -185,6 +185,8 @@ class LoggingRandomSearch(RandomSearch):
 
         return history  # return history to preserve behavior
     
+    
+#The purpose of this layer is in order to retrieve this intermediate output outside the model
 @tf.keras.utils.register_keras_serializable()
 class FosLayer(tf.keras.layers.Layer):
     def __init__(self, threshold=1.25, sharpness=5.0, **kwargs):
@@ -194,6 +196,24 @@ class FosLayer(tf.keras.layers.Layer):
         self.sharpness = sharpness 
 
     def call(self, fos):
+        return fos
+    @classmethod
+    def from_config(cls, config):  # For deserialization purpose
+        return cls(**config)
+
+
+@tf.keras.utils.register_keras_serializable()
+class FosLayerProbability(tf.keras.layers.Layer):
+    def __init__(self, threshold=1.25, sharpness=5.0, **kwargs):
+        kwargs.setdefault("name", "fos_layer_probability")  # default name if not provided
+        super(FosLayerProbability, self).__init__(**kwargs)
+        self.threshold = threshold
+        self.sharpness = sharpness 
+
+    def call(self, fos):
+        # Transforms the FOS as a probability
+        # Higher probability means more unstable slope
+        # Lower FOS produces higher probability and vice-versa
         return 1.0 / (
             1.0 + tf.exp(self.sharpness * (fos - self.threshold))
         )
